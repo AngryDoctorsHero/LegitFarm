@@ -12711,6 +12711,76 @@ NC.seasonal = (function()
             local rr = tc.CFrame:PointToObjectSpace(r.Position)
             return math.min(tc.Size.X / 2 - math.abs(rr.X), tc.Size.Z / 2 - math.abs(rr.Z)) >= 14
         end
+        -- from the entrance side: straight through the middle of the arch (CityHallPlaza, opening at 444,-106, facing
+        -- the spawn) and on along its line to the left part of the red circle. Seen live: the shortest path ran 5-7
+        -- studs right of the line the whole way and went round the right side of the plaza.
+        local ARCH, ARCH_IN, ARCH_LEFT = Vector3.new(444, 0, -106), Vector3.new(0.7071, 0, 0.7071), Vector3.new(0.7071, 0, -0.7071)
+        local fromArch = flat(root.Position) - ARCH
+        if fromArch.Magnitude < 70 and fromArch:Dot(ARCH_IN) < 4 then
+            local function inDeep()
+                return SM._isInArea and deepIn()
+            end
+            -- these legs are straight lines along the walkway: when the line is clear they are walked with MoveTo
+            -- only. Pathfinding right after enabling (its navigation data for the freshly loaded area is built on the
+            -- first request) was the lag spike on enable (seen live: 309 ms / 3 x 50 ms frames during those path
+            -- requests); pathfinding is still used when something is in the way
+            local function straight(goal, within)
+                local _, hum, root2 = getChar()
+                if not (hum and root2) then
+                    return false
+                end
+                local d = goal - root2.Position
+                d = Vector3.new(d.X, 0, d.Z)
+                if d.Magnitude > 0.5 then
+                    local op = RaycastParams.new()
+                    op.FilterType = Enum.RaycastFilterType.Exclude
+                    op.RespectCanCollide = true
+                    local ign = {}
+                    for _, plr in ipairs(Players:GetPlayers()) do
+                        if plr.Character then
+                            table.insert(ign, plr.Character)
+                        end
+                    end
+                    op.FilterDescendantsInstances = ign
+                    if workspace:Blockcast(CFrame.new(root2.Position + Vector3.new(0, 0.5, 0)), Vector3.new(3, 3, 3), d, op) then
+                        return false
+                    end
+                end
+                hum:MoveTo(goal)
+                local ref, refT, t0 = root2.Position, os.clock(), os.clock()
+                while alive() and not inDeep() and fdist(root2.Position, goal) > within do
+                    if os.clock() - refT > 0.8 then
+                        if fdist(root2.Position, ref) < 0.5 then
+                            return false
+                        end
+                        ref, refT = root2.Position, os.clock()
+                    end
+                    if os.clock() - t0 > 0.5 and os.clock() - t0 < 0.55 then
+                        hum:MoveTo(goal)
+                    end
+                    RunService.Heartbeat:Wait()
+                end
+                return true
+            end
+            local legAgents = { { AgentRadius = 2, AgentHeight = 5, AgentCanJump = false }, SM_AGENTS[1], SM_AGENTS[2] }
+            for _, k in ipairs({ 6, 40 }) do
+                local g = ground(ARCH + ARCH_IN * k + Vector3.new(0, c.Y + 4, 0))
+                if g and alive() and not inDeep() and not straight(g, 3) then
+                    walkTo(g, 3, alive, inDeep, false, legAgents)
+                end
+            end
+            local g = ground(ARCH + ARCH_IN * 80 + ARCH_LEFT * 4 + Vector3.new(0, c.Y + 4, 0))
+            if g and g.Y < floorY + 1.5 then
+                deepGoal = g
+                -- straight on (walkTo keeps moving while it plans): planning several goals first was a stop here
+                if alive() and not inDeep() and not straight(g, 2) then
+                    walkTo(g, 2, alive, inDeep, false, legAgents)
+                end
+            end
+            if SM._isInArea and deepIn() then
+                return true
+            end
+        end
         local goals = {}
         local pts = {}
         if deepGoal then
@@ -13248,7 +13318,15 @@ NC.seasonal = (function()
                         local r2 = rrState(mod)
                         return best:GetAttribute("Respawning") == true or r2 ~= req
                     end
-                    if goNear(best, { 3, 4.5, 6 }, alive, gone) and not gone() then
+                    -- take it as soon as it is in reach (4.5 studs), not only after the stand spot itself is reached
+                    local function inReach()
+                        local _, _, r2 = getChar()
+                        local bp = best:GetPivot().Position
+                        return r2 ~= nil and fdist(r2.Position, bp) <= 4.5 and math.abs(r2.Position.Y - bp.Y) < 5
+                    end
+                    if (goNear(best, { 3, 4.5, 6 }, alive, function()
+                        return gone() or inReach()
+                    end) or inReach()) and not gone() then
                         local cb = gameCallback(best, "I_Take")
                         if cb then
                             stopWalk()
