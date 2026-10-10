@@ -12299,6 +12299,36 @@ NC.seasonal = (function()
         return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
     end
 
+    -- Mobile only (touch screen without keyboard; getgenv().LFJ_ForceMobile = true to test it on PC): paths are
+    -- planned with less of the map streamed in, so thin solid things (the lamp posts by the hay bales) can be missing
+    -- from the path and walked into, and Recipe Ritual paths could leave the event area (the game removes a carried
+    -- ingredient when it is carried back in)
+    local UIS = game:GetService("UserInputService")
+    local keepInArea = false
+    local function isMobile()
+        return getgenv().LFJ_ForceMobile == true or (UIS.TouchEnabled and not UIS.KeyboardEnabled)
+    end
+
+    local function inAreaBox(p, inset)
+        local _, tc = area()
+        if not tc then
+            return true
+        end
+        local rel = tc.CFrame:PointToObjectSpace(p)
+        return math.abs(rel.X) <= tc.Size.X / 2 - inset and math.abs(rel.Z) <= tc.Size.Z / 2 - inset
+    end
+
+    local function leavesArea(path)
+        for _, w in ipairs(path:GetWaypoints()) do
+            -- only a path that actually crosses the edge (a 1-stud margin refused paths along the edge too, and every
+            -- refusal was a stop before the next spot: ~1 s delays grabbing ingredients near the edge)
+            if not inAreaBox(w.Position, 0) then
+                return true
+            end
+        end
+        return false
+    end
+
     local function ground(p, ignore)
         local rp = RaycastParams.new()
         rp.FilterType = Enum.RaycastFilterType.Exclude
@@ -12387,12 +12417,13 @@ NC.seasonal = (function()
                 hum:MoveTo(goal)
             end
             local path
+            local stayIn = keepInArea and isMobile() and inAreaBox(root.Position, 0)
             for _, cfg in ipairs(agents or SM_AGENTS) do
                 local p = PathfindingService:CreatePath(cfg)
                 local ok = pcall(function()
                     p:ComputeAsync(root.Position, goal)
                 end)
-                if ok and p.Status == Enum.PathStatus.Success then
+                if ok and p.Status == Enum.PathStatus.Success and not (stayIn and leavesArea(p)) then
                     path = p
                     break
                 end
@@ -12421,6 +12452,7 @@ NC.seasonal = (function()
             local limit = total / math.max(hum.WalkSpeed, 1) * 2 + 4
             local ref, refT = root.Position, t0
             local lastAim, lastMoveT = nil, 0
+            local obsT
             local blocked = false
             while #pts >= 2 do
                 if not alive() or (abort and abort()) then
@@ -12461,6 +12493,59 @@ NC.seasonal = (function()
                     left -= d
                     cur = nxt
                     k += 1
+                end
+                -- mobile: a solid thing right ahead that the path does not know about (a lamp post streamed in
+                -- after the path was planned) is stepped around on the side the character is already on
+                if isMobile() and os.clock() - (obsT or 0) > 0.25 then
+                    obsT = os.clock()
+                    local dir = flat(aim) - flat(p)
+                    if dir.Magnitude > 0.5 then
+                        dir = dir.Unit
+                        local op = RaycastParams.new()
+                        op.FilterType = Enum.RaycastFilterType.Exclude
+                        op.RespectCanCollide = true
+                        local ign = {}
+                        for _, plr in ipairs(Players:GetPlayers()) do
+                            if plr.Character then
+                                table.insert(ign, plr.Character)
+                            end
+                        end
+                        op.FilterDescendantsInstances = ign
+                        local hit = workspace:Blockcast(CFrame.new(p + Vector3.new(0, 0.5, 0)), Vector3.new(2, 3, 2), dir * 3.5, op)
+                        -- only tall posts (the lamp posts are 15.8 high): never the ingredient / tomb itself or low
+                        -- decor next to it (stepping around those delayed grabbing an ingredient)
+                        local hm = hit and hit.Instance:FindFirstAncestorOfClass("Model")
+                        local tagged = false
+                        while hm and not tagged do
+                            for _, tg in ipairs(CollectionService:GetTags(hm)) do
+                                if tg:find("^SeasonalMinigames") then
+                                    tagged = true
+                                end
+                            end
+                            hm = hm.Parent and hm.Parent:FindFirstAncestorOfClass("Model")
+                        end
+                        if hit and not tagged and not hit.Instance:IsA("Terrain") and math.abs(hit.Normal.Y) < 0.5
+                            and hit.Instance.Size.Y >= 6 then
+                            local o = hit.Instance
+                            local side = Vector3.new(-dir.Z, 0, dir.X)
+                            if (flat(p) - flat(o.Position)):Dot(side) < 0 then
+                                side = -side
+                            end
+                            local half = math.max(o.Size.X, o.Size.Z) / 2
+                            local dp = flat(o.Position) + side * (half + 2.5) + dir * 1
+                            dp = Vector3.new(dp.X, p.Y, dp.Z)
+                            hum:MoveTo(dp)
+                            local td = os.clock()
+                            while os.clock() - td < 1.5 and fdist(root.Position, dp) > 1.2 do
+                                if not alive() or (abort and abort()) then
+                                    return false
+                                end
+                                RunService.Heartbeat:Wait()
+                            end
+                            lastAim = nil
+                            ref, refT = root.Position, os.clock()
+                        end
+                    end
                 end
                 if not lastAim or fdist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5 then
                     hum:MoveTo(aim)
@@ -12514,6 +12599,10 @@ NC.seasonal = (function()
         for _, sp in ipairs(standPoints(obj, radii)) do
             if not alive() or (abort and abort()) or tries >= 4 then
                 return false
+            end
+            -- mobile Recipe Ritual: a spot outside the event area is skipped right away (its path would be refused)
+            if keepInArea and isMobile() and not inAreaBox(sp.p, 1) then
+                continue
             end
             tries += 1
             if walkTo(sp.p, 1.5, alive, abort) then
@@ -13143,7 +13232,8 @@ NC.seasonal = (function()
                 local best, bs
                 local now = os.clock()
                 for _, o in CollectionService:GetTagged(tag) do
-                    if o:GetAttribute("Ingredient") == req and o:GetAttribute("Respawning") ~= true and not (bad[o] and bad[o] > now) then
+                    if o:GetAttribute("Ingredient") == req and o:GetAttribute("Respawning") ~= true and not (bad[o] and bad[o] > now)
+                        and (not isMobile() or inAreaBox(o:GetPivot().Position, 2)) then
                         local d = fdist(o:GetPivot().Position, root.Position)
                         local score = d - (o:GetAttribute("IsSpecial") == true and 25 or 0)
                         if not bs or score < bs then
@@ -13216,6 +13306,7 @@ NC.seasonal = (function()
                 end
             else
                 local name, mod = current(SM)
+                keepInArea = name == "RecipeRitual"
                 local ok, err = true, nil
                 if name == "PumpkinPanic" then
                     ok, err = pcall(playPumpkin, SM, mod, alive)
