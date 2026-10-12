@@ -14138,6 +14138,262 @@ NC.ghunt = (function()
     return M
 end)()
 
+-- Troll: Remove Build Mode Barrier. A player in build mode gets Workspace.Plots.Plot_<name>.Barrier (tag "PlotBarrier",
+-- made by the game's PlotService:CreateBarrier on the "CreateBarrier" event). Its "Main" part (252 x 400 x 252, collision
+-- group PlotBarrier) is the one that blocks characters and vehicles; the black walls are its "Barrier" parts' Decals.
+-- The barrier is made on this client by the game, so it is taken out of the workspace here (this client only) the moment
+-- it appears (also every new one the server sends with "CreateBarrier": no flash) and kept; turning the toggle off puts
+-- it back. Build mode itself is the game's PlotService:GetBuildPlot(player) (not the barrier); when the player leaves
+-- build mode the toggle turns itself off.
+NC.troll = (function()
+    local M = {}
+    local CS = game:GetService("CollectionService")
+    local PlotService = require(ReplicatedStorage.Modules.PlotService)
+    local on, gen = false, 0
+    local selected
+    local byLabel = {}
+    local conns = {}
+    local dropdown, statusLabel, lastStatus, toggleObj
+    local kept -- { model = removed Barrier, plot = its plot }
+    local addConn
+    local suppress = false
+
+    local function status(text)
+        if statusLabel and text ~= lastStatus then
+            lastStatus = text
+            withUiIdentity(function()
+                statusLabel:Set("Status: " .. text)
+            end)
+        end
+    end
+
+    local function plotOf(plr)
+        local plots = workspace:FindFirstChild("Plots")
+        return plots and plots:FindFirstChild("Plot_" .. plr.Name)
+    end
+
+    local function building(plr, plot)
+        local ok, bp = pcall(function()
+            return PlotService:GetBuildPlot(plr)
+        end)
+        return ok and plot ~= nil and bp == plot
+    end
+
+    -- out of the workspace, kept to be put back
+    local function park(b)
+        if kept and kept.model ~= b then
+            pcall(function()
+                kept.model:Destroy() -- an older one: the game replaced it
+            end)
+        end
+        kept = { model = b, plot = b.Parent }
+        b.Parent = nil
+    end
+
+    local function insideBox(model)
+        local main = model:FindFirstChild("Main")
+        local _, _, root = getChar()
+        if not (main and root) then
+            return false
+        end
+        local rel = main.CFrame:PointToObjectSpace(root.Position)
+        return math.abs(rel.X) < main.Size.X / 2 + 3 and math.abs(rel.Z) < main.Size.Z / 2 + 3
+    end
+
+    -- the kept barrier goes back to its plot (only while that player is still building, and only once this character
+    -- is outside it: put back around the character it would push it under the ground)
+    local function restore(myGen)
+        local k = kept
+        if not k then
+            return
+        end
+        task.spawn(function()
+            while running and kept == k and not on and gen == myGen do
+                local owner = k.plot and k.plot.Parent and Players:FindFirstChild((k.plot.Name:gsub("^Plot_", "")))
+                if not (owner and building(owner, k.plot)) or k.plot:FindFirstChild("Barrier") then
+                    pcall(function()
+                        k.model:Destroy()
+                    end)
+                    kept = nil
+                    return
+                end
+                if not insideBox(k.model) then
+                    k.model.Parent = k.plot
+                    kept = nil
+                    status("Idle (barrier put back)")
+                    return
+                end
+                status("Barrier comes back once you are out of the plot")
+                task.wait(0.3)
+            end
+        end)
+    end
+
+    local function setToggle(v)
+        if toggleObj then
+            suppress = true
+            withUiIdentity(function()
+                toggleObj:Set(v)
+            end)
+            suppress = false
+        end
+    end
+
+
+    local function labels()
+        table.clear(byLabel)
+        local out = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local l = plr.DisplayName .. " (@" .. plr.Name .. ")"
+            byLabel[l] = plr
+            table.insert(out, l)
+        end
+        table.sort(out, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        return out
+    end
+
+    local function refresh()
+        local list = labels()
+        if dropdown then
+            withUiIdentity(function()
+                dropdown:Refresh(list)
+            end)
+        end
+    end
+
+    function M.stop(text)
+        on = false
+        gen += 1
+        if addConn then
+            addConn:Disconnect()
+            addConn = nil
+        end
+        status(text or "Idle")
+        restore(gen)
+    end
+
+    function M.start()
+        if on then
+            return
+        end
+        local plr = selected
+        local plot = plr and plr.Parent == Players and plotOf(plr)
+        if not plot then
+            status("Select a player first")
+            setToggle(false)
+            return
+        end
+        if not building(plr, plot) then
+            status(plr.DisplayName .. " is not in build mode (no barrier)")
+            setToggle(false)
+            return
+        end
+        on = true
+        gen += 1
+        local myGen = gen
+        -- a barrier is taken away in the same frame it is added (the server sends a new one now and then)
+        addConn = CS:GetInstanceAddedSignal("PlotBarrier"):Connect(function(b)
+            if on and gen == myGen and b.Name == "Barrier" and b.Parent == plot then
+                pcall(park, b)
+            end
+        end)
+        local b = plot:FindFirstChild("Barrier")
+        if b and CS:HasTag(b, "PlotBarrier") then
+            pcall(park, b)
+        end
+        status("Barrier removed for " .. plr.DisplayName)
+        task.spawn(function()
+            while running and on and gen == myGen do
+                if selected ~= plr or plr.Parent ~= Players or not building(plr, plot) then
+                    local gone = selected == plr
+                    M.stop(gone and "User has gone out of build mode." or "Idle")
+                    setToggle(false)
+                    if gone then
+                        kept = nil -- the game removes the barrier when building ends
+                    end
+                    return
+                end
+                local b2 = plot:FindFirstChild("Barrier")
+                if b2 and CS:HasTag(b2, "PlotBarrier") then
+                    pcall(park, b2)
+                end
+                task.wait(0.2)
+            end
+        end)
+    end
+
+    function M.shutdown()
+        M.stop()
+        for _, c in ipairs(conns) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+        table.clear(conns)
+    end
+
+    function M.buildUI(tab)
+        tab:CreateSection("Build Mode Barrier")
+        dropdown = tab:CreateDropdown({
+            Name = "Player",
+            Options = labels(),
+            CurrentOption = {},
+            MultipleOptions = false,
+            Flag = "LFJ_TrollPlayer",
+            Callback = function(option)
+                local l = type(option) == "table" and option[1] or option
+                selected = l and byLabel[l] or nil
+            end,
+        })
+        toggleObj = tab:CreateToggle({
+            Name = "Remove Build Mode Barrier",
+            CurrentValue = false,
+            Flag = "LFJ_TrollBarrier",
+            Callback = function(v)
+                if suppress then
+                    return
+                end
+                if v then
+                    M.start()
+                elseif on then
+                    M.stop()
+                end
+            end,
+        })
+        statusLabel = tab:CreateLabel("Status: Idle")
+        -- a build barrier left on another player's plot when nobody builds there any more (seen live: munchlaxlv100 out
+        -- of build mode, PlotService:GetBuildPlot = nil, the Barrier still standing) is taken off with the game's own
+        -- PlotService:RemoveBarrier, the same call its "RemoveBarriers" event uses
+        task.spawn(function()
+            while running do
+                pcall(function()
+                    local plots = workspace:FindFirstChild("Plots")
+                    for _, b in ipairs(CS:GetTagged("PlotBarrier")) do
+                        local plot = b.Parent
+                        local owner = plot and plot.Parent == plots and b.Name == "Barrier"
+                            and Players:FindFirstChild((plot.Name:gsub("^Plot_", "")))
+                        if owner and owner ~= LocalPlayer then
+                            local builders = PlotService:GetPlotBuilders(plot)
+                            if builders and #builders == 0 then
+                                PlotService:RemoveBarrier(plot)
+                            end
+                        end
+                    end
+                end)
+                task.wait(1)
+            end
+        end)
+        table.insert(conns, Players.PlayerAdded:Connect(refresh))
+        table.insert(conns, Players.PlayerRemoving:Connect(function(plr)
+            task.defer(refresh)
+        end))
+    end
+
+    return M
+end)()
+
 local hookConns = {}
 local function hook(name, fn)
     local ok, handle = pcall(function()
@@ -14464,6 +14720,8 @@ NC.ghunt.buildUI(HalloweenTab)
 
 NC.store.buildUI()
 
+NC.troll.buildUI(Window:CreateTab("Troll", "skull"))
+
 -- Anti AFK
 NC.afk = (function()
     local A = {}
@@ -14502,6 +14760,7 @@ getgenv().LegitFarmJob = function()
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
+    pcall(NC.troll.shutdown)
     pcall(NC.mood.shutdown)
     pcall(NC.store.shutdown)
     pcall(NC.shared.shutdown)
