@@ -15708,7 +15708,15 @@ NC.market = (function()
             return
         end
         if not (station and station.Parent) then
-            station = pickStation()
+            -- back after Auto Farm was off: the register it worked at last, when its customer is still there (and no
+            -- other player works it); otherwise one at random as before
+            local last = K.last
+            if last and last.Parent and last:FindFirstChild("Occupied") and last.Occupied.Value and not takenByOther(last) then
+                station = last
+            else
+                station = pickStation()
+            end
+            K.last = station
             if not station then
                 setStatus("No free register, waiting")
                 task.wait(1.5)
@@ -16926,6 +16934,74 @@ local function endShift()
     endingShift = false
 end
 
+-- Force End Shift (any job). Found live in the game's JobHandler: every job has a client-side area part
+-- (JobArea_<job>, the job module's AreaBlock) whose Touched starts the shift (StartWorking) when the character's
+-- UpperTorso touches it; when a shift ends the part is put back into the world around the character and starts the
+-- shift again right away (live, Pizza Baker: StopWorking -> ended, 0.07 s later started again). RequestStopWorking
+-- refuses inside the area. So: the area part stops reacting to touches (CanTouch off, this client only), the game's own
+-- StopWorking ends the shift, and the part reacts again once the character has walked out of the area - walking back
+-- in starts a shift the normal way. No teleport.
+NC.forceEndOn = false
+function NC.forceEndRestore()
+    local ab = NC.forceEndArea
+    NC.forceEndArea = nil
+    if ab then
+        pcall(function()
+            ab.CanTouch = true
+        end)
+    end
+end
+function NC.forceEndShift()
+    task.spawn(function()
+        pcall(function()
+            if not JobHandler:IsWorking() then
+                return
+            end
+            local mod = JobHandler:GetCurJobModule()
+            local ab = mod and mod.AreaBlock
+            NC.forceEndRestore()
+            if typeof(ab) == "Instance" and ab:IsA("BasePart") then
+                ab.CanTouch = false
+                NC.forceEndArea = ab
+            end
+            -- let go of a station / seat / vehicle first (the game's own detach)
+            pcall(function()
+                if JobHandler.Shared.AttachService:GetAttachWeld(LocalPlayer.Character) then
+                    JobHandler.Modules.CharacterHandler:Detach()
+                end
+            end)
+            for _ = 1, 3 do
+                pcall(function()
+                    JobHandler:StopWorking()
+                end)
+                local t0 = os.clock()
+                while os.clock() - t0 < 1.5 and JobHandler:IsWorking() do
+                    task.wait(0.1)
+                end
+                if not JobHandler:IsWorking() then
+                    break
+                end
+            end
+            if not ab or NC.forceEndArea ~= ab then
+                return
+            end
+            -- the area part reacts again once the character is out of it (re-entering starts a shift as usual)
+            while running and NC.forceEndArea == ab do
+                local _, _, root = getChar()
+                if root and ab.Parent then
+                    local rel = ab.CFrame:PointToObjectSpace(root.Position)
+                    local half = ab.Size / 2
+                    if math.abs(rel.X) > half.X + 3 or math.abs(rel.Y) > half.Y + 3 or math.abs(rel.Z) > half.Z + 3 then
+                        NC.forceEndRestore()
+                        break
+                    end
+                end
+                task.wait(0.2)
+            end
+        end)
+    end)
+end
+
 local function farmStep()
     if not farming then
         task.wait(0.3)
@@ -17069,9 +17145,22 @@ FarmToggle = JobsTab:CreateToggle({
             end
             setStatus("Idle")
             if wasFarming then
-                endShift()
+                if NC.forceEndOn then
+                    NC.forceEndShift()
+                else
+                    endShift()
+                end
             end
         end
+    end,
+})
+
+JobsTab:CreateToggle({
+    Name = "Force End Shift",
+    CurrentValue = false,
+    Flag = "LFJ_ForceEndShift",
+    Callback = function(value)
+        NC.forceEndOn = value
     end,
 })
 
@@ -17190,6 +17279,41 @@ NC.afk = (function()
     return A
 end)()
 
+-- On the ground at every job: found live, the game's teleport to a job (GoToWork) puts the character on the job's
+-- WorkTeleport_<job> part (Environment.Locations..., 4 x 0.2 x 4, Transparency 1 but CanCollide true) lying on the floor,
+-- so the character stood 0.29 studs above the floor (Pizza Baker) until it walked off. Those parts stop colliding on this
+-- client only (they are invisible and only mark the teleport spot); new ones that stream in get the same.
+NC.pads = (function()
+    local P = {}
+    local changed, conn = {}, nil
+    local function fix(d)
+        if d:IsA("BasePart") and d.CanCollide and d.Name:sub(1, 13) == "WorkTeleport_" then
+            d.CanCollide = false
+            changed[d] = true
+        end
+    end
+    pcall(function()
+        local env = workspace:WaitForChild("Environment", 10)
+        for _, d in ipairs(env:GetDescendants()) do
+            fix(d)
+        end
+        conn = env.DescendantAdded:Connect(fix)
+    end)
+    function P.stop()
+        if conn then
+            conn:Disconnect()
+            conn = nil
+        end
+        for d in pairs(changed) do
+            pcall(function()
+                d.CanCollide = true
+            end)
+        end
+        table.clear(changed)
+    end
+    return P
+end)()
+
 -- Cleanup
 getgenv().LegitFarmJob = function()
     local wasFarming = farming
@@ -17217,6 +17341,8 @@ getgenv().LegitFarmJob = function()
     pcall(NC.store.shutdown)
     pcall(NC.shared.shutdown)
     pcall(NC.afk.stop)
+    pcall(NC.forceEndRestore)
+    pcall(NC.pads.stop)
     for _, conn in ipairs(plotConns) do
         pcall(function()
             conn:Disconnect()
