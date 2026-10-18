@@ -38,6 +38,7 @@ local JOB_IDS = {
     [JOB_NAME] = JOB_ID, [JANITOR_NAME] = JANITOR_ID, [TAXI_NAME] = TAXI_ID, [ICE_NAME] = ICE_ID, [CASH_NAME] = CASH_ID,
     ["Fast Food Worker - Burger Cook"] = CASH_ID, [PIZZA_NAME] = PIZZA_ID, [TEACHER_NAME] = TEACHER_ID,
     ["BFF Supermarket"] = "SupermarketCashier", ["Hairdresser - Stylez Hair Studio"] = "StylezHairdresser",
+    ["Fisherman - Fishing Hut"] = "HutFisherman",
 }
 local CHOP_RANGE = 6
 local MAX_SWINGS = 25
@@ -16453,6 +16454,360 @@ NC.hair = (function()
     return H
 end)()
 
+-- Fisherman - Fishing Hut (job id HutFisherman). Found live: the hut is Environment.Locations.Beach.FishingHut (the shift
+-- starts inside it, its doorway is on the south side, no door part); the sea is west of it (sand from x -280 down to the
+-- water at x -348, the way down is the dock's small stair platform). Cast / Pull is the equipped Fishing Rod's own hotbar
+-- function (HotbarUI.EquipData, Title "I_Cast" / "I_Pull", module HotbarUI.EquippedModules.FishingRod): Cast only works
+-- when a ray 12 studs in front of the character, 20 studs down, hits Terrain water. The bobber is the rod's Vector3Value
+-- "Pos" (the server's bobber spot): a bite is Pos.Y dropping 1 stud under the water surface for ~1.1-1.8 s; a Pull then
+-- catches the fish (JobHandler.HutFisherman.TasksPerformed +1, "GotFish"). Unequipping the rod ends the shift.
+NC.fish = (function()
+    local F = {}
+    local JOB = "HutFisherman"
+    local WATER_DIR = Vector3.new(-1, 0, 0)
+    local AGENTS = {
+        { AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = false },
+        { AgentRadius = 1, AgentHeight = 5, AgentCanJump = false },
+    }
+    local spot, watchRod, watchConn, baseY, pulled, castAt
+    local outerSetStatus = setStatus
+    local function setStatus(text)
+        if farming then
+            outerSetStatus(text)
+        end
+    end
+
+    local function alive()
+        return running and farming and isWorkingJob(JOB)
+    end
+
+    local function flatDist(a, b)
+        return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+    end
+
+    local function rodData()
+        local ed = HotbarUI.EquipData
+        if type(ed) == "table" and ed.Name == "Fishing Rod" and type(ed.Function) == "function" then
+            return ed
+        end
+    end
+
+    local function caught()
+        local ok, n = pcall(function()
+            return JobHandler:GetCurJobModule().TasksPerformed
+        end)
+        return ok and tonumber(n) or 0
+    end
+
+    -- the rod's own Cast / Pull (only the game's closure)
+    local function use(ed)
+        if not cleanSafe(ed.Function) then
+            farming = false
+            if FarmToggle then
+                withUiIdentity(function()
+                    FarmToggle:Set(false)
+                end)
+            end
+            outerSetStatus("Stopped: unsafe fishing state")
+            return false
+        end
+        task.spawn(function()
+            pcall(ed.Function)
+        end)
+        return true
+    end
+
+    -- the bobber going under: pulled the moment the rod's Pos drops under the water surface it landed on
+    local function watch()
+        local char = LocalPlayer.Character
+        local rod = char and char:FindFirstChild("Fishing Rod")
+        if rod == watchRod and watchConn then
+            return
+        end
+        if watchConn then
+            watchConn:Disconnect()
+            watchConn = nil
+        end
+        watchRod = rod
+        local pos = rod and rod:FindFirstChild("Pos")
+        if not pos then
+            return
+        end
+        watchConn = pos.Changed:Connect(function(v)
+            if not (running and farming) then
+                return
+            end
+            if v.X == 0 and v.Y == 0 and v.Z == 0 then
+                baseY = nil -- line pulled in
+                return
+            end
+            if not baseY then
+                baseY = v.Y -- where the bobber landed (the water surface)
+                return
+            end
+            if v.Y < baseY - 0.5 and not pulled then
+                local ed = rodData()
+                if ed and ed.Title == "I_Pull" then
+                    pulled = true
+                    use(ed)
+                end
+            end
+        end)
+    end
+
+    -- the shore spot: going from the hut toward the water, the first sand spot the game's cast ray reaches water from,
+    -- 2 studs further (live: x -340, the water starts at -348)
+    local function findSpot()
+        local n = workspace:FindFirstChild("Environment")
+        for _, name in ipairs({ "Locations", "Beach", "FishingHut", "Origin" }) do
+            n = n and n:FindFirstChild(name)
+        end
+        if not n then
+            return nil
+        end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.IgnoreWater = false
+        local ignore = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        params.FilterDescendantsInstances = ignore
+        local base = n.Position - Vector3.new(0, 0, 3)
+        for k = 20, 140 do
+            local p = base + WATER_DIR * k
+            local g = workspace:Raycast(Vector3.new(p.X, 60, p.Z), Vector3.new(0, -120, 0), params)
+            if g and g.Instance == workspace.Terrain then
+                if g.Material == Enum.Material.Water then
+                    return nil
+                end
+                local a = Vector3.new(p.X, g.Position.Y + 3, p.Z) + WATER_DIR * 12
+                local w = workspace:Raycast(a, Vector3.new(0, -20, 0), params)
+                if w and w.Instance == workspace.Terrain and w.Material == Enum.Material.Water then
+                    -- on toward the water to the last sand before it (live: sand -347, water from -348), half a stud
+                    -- back from it: right where the sand meets the water, so the cast lands well out in the water
+                    local last = g.Position
+                    for s = 0.5, 30, 0.5 do
+                        local q = p + WATER_DIR * s
+                        local g2 = workspace:Raycast(Vector3.new(q.X, 60, q.Z), Vector3.new(0, -120, 0), params)
+                        if not g2 or g2.Material == Enum.Material.Water then
+                            break
+                        end
+                        last = g2.Position
+                    end
+                    return last - WATER_DIR * 0.5
+                end
+            end
+        end
+    end
+
+    -- walking: Humanoid:MoveTo toward a point 2 studs ahead on the pathfinding line (out of the hut door, along the dock,
+    -- down the stair platform, over the sand), so it never stops at a waypoint; no headway for 0.9 s -> planned again
+    local function planPath(from, goal)
+        for _, cfg in ipairs(AGENTS) do
+            local p = PathfindingService:CreatePath(cfg)
+            local ok = pcall(function()
+                p:ComputeAsync(from, goal)
+            end)
+            if ok and p.Status == Enum.PathStatus.Success then
+                local wps = p:GetWaypoints()
+                local jump = false
+                for _, w in ipairs(wps) do
+                    if w.Action == Enum.PathWaypointAction.Jump then
+                        jump = true
+                    end
+                end
+                if not jump and #wps > 0 and flatDist(wps[#wps].Position, goal) < 3 then
+                    return wps
+                end
+            end
+        end
+    end
+
+    local function walk(goal)
+        for _ = 1, 4 do
+            if not alive() then
+                return false
+            end
+            local _, hum, root = getChar()
+            if not (hum and root) then
+                return false
+            end
+            if flatDist(root.Position, goal) <= 1.2 then
+                return true
+            end
+            local wps = planPath(root.Position, goal)
+            if not wps then
+                return false
+            end
+            local line = { root.Position }
+            for i = 2, #wps do
+                line[#line + 1] = wps[i].Position
+            end
+            local seg, stuck = 1, false
+            local ref, refT = root.Position, os.clock()
+            local lastAim, lastMoveT = nil, 0
+            while alive() do
+                local p = root.Position
+                if flatDist(p, goal) <= 1.2 then
+                    break
+                end
+                while seg < #line - 1 do
+                    local a, b = line[seg], line[seg + 1]
+                    local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                    local l2 = ab:Dot(ab)
+                    local t = l2 > 1e-6 and Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2 or 1
+                    if t >= 1 or flatDist(p, b) <= 1.2 then
+                        seg += 1
+                    else
+                        break
+                    end
+                end
+                local a, b = line[seg], line[seg + 1] or line[seg]
+                local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                local l2 = ab:Dot(ab)
+                local t = l2 > 1e-6 and math.clamp(Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2, 0, 1) or 1
+                local cur, left, aim = a:Lerp(b, t), 2, line[#line]
+                local k = seg
+                while k < #line do
+                    local nxt = line[k + 1]
+                    local d = flatDist(cur, nxt)
+                    if d >= left then
+                        aim = cur:Lerp(nxt, d > 1e-6 and left / d or 1)
+                        break
+                    end
+                    left -= d
+                    cur = nxt
+                    k += 1
+                end
+                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5 then
+                    hum:MoveTo(aim)
+                    lastAim, lastMoveT = aim, os.clock()
+                end
+                if os.clock() - refT > 0.9 then
+                    if flatDist(p, ref) < 0.5 then
+                        stuck = true
+                        break
+                    end
+                    ref, refT = p, os.clock()
+                end
+                RunService.Heartbeat:Wait()
+            end
+            if not stuck then
+                return alive() and flatDist(root.Position, goal) <= 1.5
+            end
+        end
+        return false
+    end
+
+    -- turned toward the water by a short step that way (the cast goes where the character faces)
+    local function face()
+        local _, hum, root = getChar()
+        if not (hum and root) or root.CFrame.LookVector:Dot(WATER_DIR) > 0.95 then
+            return
+        end
+        hum:MoveTo(root.Position + WATER_DIR * 1.5)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < 1 and root.CFrame.LookVector:Dot(WATER_DIR) < 0.95 do
+            RunService.Heartbeat:Wait()
+        end
+        hum:MoveTo(root.Position)
+    end
+
+    function F.step()
+        if not farming then
+            task.wait(0.3)
+            return
+        end
+        if not isWorkingJob(JOB) then
+            setStatus("Start the Fisherman job first")
+            task.wait(1)
+            return
+        end
+        local _, hum, root = getChar()
+        if not hum then
+            setStatus("Waiting for character")
+            task.wait(1)
+            return
+        end
+        local ed = rodData()
+        if not ed then
+            setStatus("Waiting for the Fishing Rod")
+            task.wait(0.3)
+            return
+        end
+        watch()
+        spot = spot or findSpot()
+        if not spot then
+            setStatus("No fishing spot found, waiting")
+            task.wait(2)
+            return
+        end
+        if flatDist(root.Position, spot) > 2.5 then
+            if ed.Title == "I_Pull" then
+                pulled = true
+                use(ed) -- the line comes in before walking
+                task.wait(1.5)
+                return
+            end
+            setStatus("Walking to the water")
+            if walk(spot) then
+                face()
+            elseif farming then
+                setStatus("Can't reach the water, retrying")
+                spot = nil
+                task.wait(1)
+            end
+            return
+        end
+        if ed.Title == "I_Cast" then
+            face()
+            setStatus("Casting")
+            baseY, pulled = nil, false
+            if not use(ed) then
+                return
+            end
+            local t0 = os.clock()
+            while alive() and os.clock() - t0 < 2.5 and ed.Title == "I_Cast" and HotbarUI.EquipData == ed do
+                task.wait()
+            end
+            if ed.Title == "I_Cast" and HotbarUI.EquipData == ed then
+                -- the cast did not reach water from here: 1.5 studs closer to it (never into it)
+                spot = spot + WATER_DIR * 1.5
+                hum:MoveTo(spot)
+                local t1 = os.clock()
+                while alive() and os.clock() - t1 < 1.5 and flatDist(root.Position, spot) > 0.8 do
+                    RunService.Heartbeat:Wait()
+                end
+            end
+            castAt = os.clock()
+            return
+        end
+        if ed.Title == "I_Pull" then
+            setStatus(string.format("Waiting for a bite (%d caught)", caught()))
+            if not pulled and castAt and os.clock() - castAt > 60 then
+                pulled = true
+                use(ed) -- no bite for a minute: in and cast again
+            end
+            task.wait()
+            return
+        end
+        task.wait() -- the cast / pull animation is playing
+    end
+
+    function F.stop()
+        if watchConn then
+            watchConn:Disconnect()
+            watchConn = nil
+        end
+        watchRod, spot, baseY, pulled, castAt = nil, nil, nil, nil, nil
+    end
+
+    return F
+end)()
+
 local hookConns = {}
 local function hook(name, fn)
     local ok, handle = pcall(function()
@@ -16592,7 +16947,8 @@ local function farmLoop()
             or selectedJob == ICE_NAME and iceStep or selectedJob == CASH_NAME and cashStep
             or selectedJob == "Fast Food Worker - Burger Cook" and NC.cook.step or selectedJob == PIZZA_NAME and NC.pizza.step
             or selectedJob == TEACHER_NAME and NC.teacher.step or selectedJob == "BFF Supermarket" and NC.market.step
-            or selectedJob == "Hairdresser - Stylez Hair Studio" and NC.hair.step or farmStep)
+            or selectedJob == "Hairdresser - Stylez Hair Studio" and NC.hair.step
+            or selectedJob == "Fisherman - Fishing Hut" and NC.fish.step or farmStep)
         if not ok then
             warn("[Legit Farm Job] " .. tostring(err))
             setStatus("Error, retrying")
@@ -16606,7 +16962,7 @@ end
 -- UI
 JobsTab:CreateDropdown({
     Name = "Select Job",
-    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio" },
+    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio", "Fisherman - Fishing Hut" },
     CurrentOption = {},
     MultipleOptions = false,
     Flag = "LFJ_Job",
@@ -16681,6 +17037,7 @@ FarmToggle = JobsTab:CreateToggle({
             pcall(NC.teacher.stop)
             pcall(NC.market.stop)
             pcall(NC.hair.stop)
+            pcall(NC.fish.stop)
             if selectedJob ~= "Fast Food Worker - Burger Cook" then
                 stopWalking()
             end
@@ -16824,6 +17181,7 @@ getgenv().LegitFarmJob = function()
     pcall(NC.teacher.stop)
     pcall(NC.market.stop)
     pcall(NC.hair.stop)
+    pcall(NC.fish.stop)
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
