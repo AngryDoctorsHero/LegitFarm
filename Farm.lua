@@ -37,6 +37,7 @@ local TEACHER_ID = "HighSchoolTeacher"
 local JOB_IDS = {
     [JOB_NAME] = JOB_ID, [JANITOR_NAME] = JANITOR_ID, [TAXI_NAME] = TAXI_ID, [ICE_NAME] = ICE_ID, [CASH_NAME] = CASH_ID,
     ["Fast Food Worker - Burger Cook"] = CASH_ID, [PIZZA_NAME] = PIZZA_ID, [TEACHER_NAME] = TEACHER_ID,
+    ["BFF Supermarket"] = "SupermarketCashier", ["Hairdresser - Stylez Hair Studio"] = "StylezHairdresser",
 }
 local CHOP_RANGE = 6
 local MAX_SWINGS = 25
@@ -2870,13 +2871,15 @@ function iceInsideArea(pos)
     return ok and inside
 end
 
--- the shop-side window spot that belongs to a customer slot
-local function iceWindowOf(shop, slot)
+-- the shop-side window the customer is standing at (the NPC's own position; its slot when it has no body yet)
+local function iceWindowOf(shop, slot, npc)
     local origins = shop:FindFirstChild("OrderOrigins")
+    local body = npc and (npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart)
+    local at = body and body.Position or slot.Position
     local best, bestD
     if origins then
         for _, o in ipairs(origins:GetChildren()) do
-            local d = (o.Position - slot.Position).Magnitude
+            local d = (Vector3.new(o.Position.X, 0, o.Position.Z) - Vector3.new(at.X, 0, at.Z)).Magnitude
             if not bestD or d < bestD then
                 best, bestD = o, d
             end
@@ -2967,6 +2970,7 @@ local function iceServe(shop, slot, npc, items)
         end
     end
 
+    local prevItem
     for _, item in ipairs(items) do
         if not (running and farming) then
             walkAbort, walkProgress = nil, nil
@@ -2975,6 +2979,7 @@ local function iceServe(shop, slot, npc, items)
         if not iceValid(slot, npc) then
             return fail("Customer left, moving on")
         end
+        prevItem = item.name
         local station = toTake:FindFirstChild(item.name)
         if not station then
             return fail("Station " .. item.name .. " not found")
@@ -2989,6 +2994,14 @@ local function iceServe(shop, slot, npc, items)
         end
         local before = iceFilled(cup)
         local added = false
+        -- a second scoop comes 0.25-0.30 s after the first one landed, same flavour or not (the player's own pace,
+        -- measured live: 0.25-0.30 s between scoops)
+        if item.kind == "scoop" and NC.iceLastScoop and before > 0 then
+            local gap = 0.25 + math.random() * 0.05
+            while running and farming and os.clock() - NC.iceLastScoop < gap do
+                task.wait()
+            end
+        end
         for _ = 1, 8 do
             local cb = iceCallback(station, "B_Add")
             if cb then
@@ -3002,6 +3015,7 @@ local function iceServe(shop, slot, npc, items)
                         local c = iceCup()
                         if c and iceFilled(c) > before then
                             added = true
+                            NC.iceLastScoop = os.clock()
                             break
                         end
                         task.wait(0.03)
@@ -3027,12 +3041,19 @@ local function iceServe(shop, slot, npc, items)
         return fail("Customer left, moving on")
     end
     setStatus("Serving customer")
-    local window = iceWindowOf(shop, slot)
+    local window = iceWindowOf(shop, slot, npc)
     if not (window and iceWalkNear(shop, window)) then
         return fail("Can't reach the window, retrying")
     end
     walkAbort, walkProgress = nil, nil
     local orderValue = npc:FindFirstChild("Order")
+    -- the customer's order bubble is the game's: it is removed the moment the server decides on the order (Order
+    -- changes). Only a customer still waiting with this same order gets the cup; otherwise it is thrown away
+    local still = orderValue and orderValue.Value == "" and iceReadOrder(npc)
+    if not (still and iceDescribe(still) == iceDescribe(items)) then
+        iceDiscardCup()
+        return fail("Customer no longer waiting for this order, next one")
+    end
     local gave = false
     for _ = 1, 6 do
         if not iceValid(slot, npc) then
@@ -3520,7 +3541,7 @@ local function cashAddIngredient(ing, tray, name)
 end
 
 -- Type / Size button of the Side and Drink pages
-local function cashPickRadio(page, group, name)
+local function cashPickRadio(page, group, name, last)
     local grp = page:FindFirstChild(group)
     local btn = grp and grp:FindFirstChild(name)
     if not btn then
@@ -3540,7 +3561,9 @@ local function cashPickRadio(page, group, name)
         while os.clock() - t0 < 0.8 do
             task.wait(0.05)
             if btn:GetAttribute("Selected") then
-                cashPause(0.4, 0.7)
+                if not last then -- (the last button of the order: nothing left to add, it is submitted right away)
+                    cashPause(0.4, 0.7)
+                end
                 return true
             end
         end
@@ -3548,7 +3571,7 @@ local function cashPickRadio(page, group, name)
     return false, name .. " could not be selected"
 end
 
-local function cashPickSideOrDrink(gui, state, tray, pageName, item)
+local function cashPickSideOrDrink(gui, state, tray, pageName, item, last)
     if not cashSelectTab(gui, state, pageName) then
         return false, "could not open the " .. pageName .. " tab"
     end
@@ -3579,7 +3602,7 @@ local function cashPickSideOrDrink(gui, state, tray, pageName, item)
     if not ok then
         return false, why
     end
-    ok, why, locked = cashPickRadio(page, "Size", sizeName)
+    ok, why, locked = cashPickRadio(page, "Size", sizeName, last)
     if not ok and locked then
         local alt = firstUnlocked("Size", sizeName)
         if not alt then
@@ -3587,7 +3610,7 @@ local function cashPickSideOrDrink(gui, state, tray, pageName, item)
         end
         warn("[Legit Farm Job] cashier: size " .. sizeName .. " is locked, using " .. alt .. " instead")
         sizeName, substituted = alt, true
-        ok, why = cashPickRadio(page, "Size", sizeName)
+        ok, why = cashPickRadio(page, "Size", sizeName, last)
     end
     if not ok then
         return false, why
@@ -3658,7 +3681,7 @@ local function cashBuild(gui, state, station, npc, order)
     end
     cashStatus("Adding " .. (order.side.name:gsub(" %b[]", "")))
     local sub
-    ok, why, sub = cashPickSideOrDrink(gui, state, tray, "Side", order.side)
+    ok, why, sub = cashPickSideOrDrink(gui, state, tray, "Side", order.side, not order.drink)
     if not ok then
         return false, why
     end
@@ -3669,7 +3692,7 @@ local function cashBuild(gui, state, station, npc, order)
             return false, "customer left"
         end
         cashStatus("Adding " .. order.drink.name)
-        ok, why, sub = cashPickSideOrDrink(gui, state, tray, "Drink", order.drink)
+        ok, why, sub = cashPickSideOrDrink(gui, state, tray, "Drink", order.drink, true)
         if not ok then
             return false, why
         end
@@ -3932,7 +3955,8 @@ function cashStep()
     if not cashAlive(state, npc) then
         return
     end
-    cashPause(0.9, 1.5)
+    -- a brief look at the finished order before the checkmark (the old 0.9-1.5 s pause here stays gone)
+    cashPause(0.35, 0.6)
     cashStatus("Confirming order")
     cashPress(gui.Tabs:FindFirstChild("Confirm"))
     local t0 = os.clock()
@@ -4567,7 +4591,17 @@ NC.cook = (function()
             unsafe("Stopped: unsafe cook state")
             return nil
         end
+        -- a minigame still open never blocks the next ingredient for good: after 5 s it is closed with the game's own
+        -- Cleanup (the wait used to have no limit)
+        local tLF = os.clock()
         while LF:IsRunning() and alive() do
+            if os.clock() - tLF > 5 then
+                warn("[Legit Farm Job] cook: a minigame stayed open for 5 s, it is closed")
+                pcall(function()
+                    LF:Cleanup()
+                end)
+                break
+            end
             task.wait(0.05)
         end
         aim = { part = fill, pos = fill.Position + Vector3.new(0, 0.2, 0) }
@@ -6334,6 +6368,51 @@ NC.cook = (function()
     -- Entry points
     local busy = false
 
+    -- stuck watchdog (seen: the cook stuck at the Assembly board between the ingredient bins): an ingredient / burger held
+    -- in the drag for 10 s (putting one in place takes ~1-3 s) or a minigame open for 8 s is stuck. It is let go with the
+    -- game's own stopDrag / LineFollow:Cleanup; the step that waited on it then fails and the cook goes on
+    local watching = false
+    local function startWatchdog()
+        if watching then
+            return
+        end
+        watching = true
+        task.spawn(function()
+            local held, heldSince, lfSince = nil, 0, nil
+            while hooked and running and farming do
+                local okD, obj = pcall(function()
+                    return DS:GetDraggedObject()
+                end)
+                obj = okD and obj or nil
+                if obj ~= held then
+                    held, heldSince = obj, os.clock()
+                elseif obj and os.clock() - heldSince > 10 then
+                    warn("[Legit Farm Job] cook: " .. tostring(obj) .. " was held for 10 s (stuck), it is let go")
+                    aim = nil
+                    pcall(dropObj, nil)
+                    held = nil
+                end
+                local okL, lfOn = pcall(function()
+                    return LF:IsRunning()
+                end)
+                if okL and lfOn then
+                    lfSince = lfSince or os.clock()
+                    if os.clock() - lfSince > 8 then
+                        warn("[Legit Farm Job] cook: a minigame stayed open for 8 s (stuck), it is closed")
+                        pcall(function()
+                            LF:Cleanup()
+                        end)
+                        lfSince = nil
+                    end
+                else
+                    lfSince = nil
+                end
+                task.wait(0.5)
+            end
+            watching = false
+        end)
+    end
+
     local function stepInner()
         if not farming then
             task.wait(0.3)
@@ -6366,6 +6445,7 @@ NC.cook = (function()
             return
         end
         installHooks()
+        startWatchdog()
         if os.clock() - lastStep > 5 then
             progress()
         end
@@ -8084,6 +8164,7 @@ NC.shared = (function()
     local deselectedKinds = {}
     local SELECT_ALL, DESELECT_ALL = "Select All", "Deselect All"
     local trayMax
+    local TRAY_MAX = 21
     local playerDD, foodDD, espToggle, storeToggle, statusLabel, lastStatus
     local playerFrame, foodFrame, espFrame, storeFrame, statusFrame
     local suppress, espOn, storing, finishing, pending = false, false, false, false, false
@@ -8213,26 +8294,35 @@ NC.shared = (function()
     end
 
     local function relabel(list)
+        -- sort keys read once per part (seen live: reading Name / Position inside the sort for 6160 foods took 348 ms,
+        -- a freeze on every grab)
+        local key = {}
+        for _, p in ipairs(list) do
+            local pos = p.Position
+            key[p] = { p.Name, pos.X, pos.Z }
+        end
         table.sort(list, function(a, b)
-            if a.Name ~= b.Name then
-                return a.Name < b.Name
+            local ka, kb = key[a], key[b]
+            if ka[1] ~= kb[1] then
+                return ka[1] < kb[1]
             end
-            if math.abs(a.Position.X - b.Position.X) > 0.01 then
-                return a.Position.X < b.Position.X
+            if math.abs(ka[2] - kb[2]) > 0.01 then
+                return ka[2] < kb[2]
             end
-            return a.Position.Z < b.Position.Z
+            return ka[3] < kb[3]
         end)
         local newCount = {}
         for _, p in ipairs(list) do
             if not labelStore[p] then
-                newCount[p.Name] = (newCount[p.Name] or 0) + 1
+                newCount[key[p][1]] = (newCount[key[p][1]] or 0) + 1
             end
         end
         for _, p in ipairs(list) do
             if not labelStore[p] then
-                local seq = (labelSeq[p.Name] or 0) + 1
-                labelSeq[p.Name] = seq
-                labelStore[p] = (seq == 1 and newCount[p.Name] == 1) and p.Name or (p.Name .. " #" .. seq)
+                local name = key[p][1]
+                local seq = (labelSeq[name] or 0) + 1
+                labelSeq[name] = seq
+                labelStore[p] = (seq == 1 and newCount[name] == 1) and name or (name .. " #" .. seq)
             end
         end
         labelOf, partOf = {}, {}
@@ -8463,14 +8553,57 @@ NC.shared = (function()
         syncESP()
     end
 
-    local function scheduleRefresh()
+    -- food that was only taken away (a grab) is dropped from the lists without scanning / sorting the whole plot again
+    -- (seen live: that full refresh was a ~400 ms freeze after every grab with 6160 foods on the plot)
+    local removedPending, fullPending = {}, false
+    local function quickRemove()
+        pending = false
+        local gone = removedPending
+        removedPending = {}
+        if next(gone) == nil then
+            return
+        end
+        local keep = {}
+        local list = foodFrame and foodFrame:FindFirstChild("List")
+        for _, p in ipairs(foods) do
+            if gone[p] then
+                local l = labelOf[p]
+                labelOf[p] = nil
+                selected[p] = nil
+                if l then
+                    partOf[l] = nil
+                    local row = list and list:FindFirstChild(l)
+                    if row then
+                        row.Visible = false -- the dropdown row of a taken food (the next full refresh rebuilds the list)
+                    end
+                end
+            else
+                keep[#keep + 1] = p
+            end
+        end
+        foods = keep
+        syncESP()
+    end
+
+    local function scheduleRefresh(removed)
+        if removed then
+            removedPending[removed] = true
+        else
+            fullPending = true
+        end
         if pending or not running then
             return
         end
         pending = true
         task.delay(0.4, function()
             if running then
-                refreshFood()
+                if fullPending then
+                    fullPending = false
+                    table.clear(removedPending)
+                    refreshFood()
+                else
+                    quickRemove()
+                end
             else
                 pending = false
             end
@@ -8499,7 +8632,7 @@ NC.shared = (function()
             end))
             table.insert(plotConns, plot.DescendantRemoving:Connect(function(d)
                 if d.Parent and (d.Parent.Name == "ItemHolder" or (d:IsA("BasePart") and onFloor(d))) then
-                    scheduleRefresh()
+                    scheduleRefresh(d)
                 end
             end))
         end
@@ -8828,6 +8961,9 @@ NC.shared = (function()
 
     local function take(part)
         local before = holding()
+        if before >= TRAY_MAX then
+            return false, "full"
+        end
         local sawTake = false
         for _ = 1, 3 do
             if not active() then
@@ -8854,8 +8990,9 @@ NC.shared = (function()
                     task.wait(0.1)
                 end
                 if before > 0 and active() then
+                    -- one take with no answer is not a full tray (a slow answer / food someone else took): the loop only
+                    -- calls the tray full when two different foods are refused at the same count
                     closeMenu()
-                    trayMax = before
                     return false, "full"
                 end
             else
@@ -8952,32 +9089,45 @@ NC.shared = (function()
         return out
     end
 
+    -- on the plot = over its ground (250 x 250) or near it. Seen live: the House pivot sits at the plot's edge, so the old
+    -- "within 160 studs of the House pivot" said "not at the plot" next to food on the far side (1364 of 1995 objects there)
+    local function plotGround()
+        local gp = plot and plot:FindFirstChild("GroundParts")
+        local g = gp and gp:FindFirstChild("Ground")
+        return g and g:IsA("BasePart") and g or nil
+    end
+
     local function atPlot()
         if not plot then
             return false
         end
         local _, _, root = getChar()
-        local house = plot:FindFirstChild("House")
-        if not (root and house) then
+        local g = plotGround()
+        if not (root and g) then
             return false
         end
-        return (flat(root.Position) - flat(house:GetPivot().Position)).Magnitude < 160
+        local rel = g.CFrame:PointToObjectSpace(root.Position)
+        return math.abs(rel.X) < g.Size.X / 2 + 40 and math.abs(rel.Z) < g.Size.Z / 2 + 40
     end
 
+    -- walking only, never a teleport: toward the plot along pathfinding waypoints
     local function goToPlot()
-        if os.clock() - toPlotAt < 8 then
+        if os.clock() - toPlotAt < 3 then
             return
         end
         toPlotAt = os.clock()
-        status("Going to the plot")
-        local who = target
-        pcall(function()
-            require(PlayerModules:WaitForChild("HouseHandler")):ToPlot(who)
-        end)
-        local t0 = os.clock()
-        while active() and os.clock() - t0 < 20 and not atPlot() do
-            watchPlot()
-            task.wait(0.5)
+        local g = plotGround()
+        local _, _, root = getChar()
+        if not (g and root) then
+            status("Walk to " .. (target and target.DisplayName or "the") .. "'s plot")
+            return
+        end
+        status("Walking to the plot")
+        local c = g.Position
+        local d = flat(root.Position) - flat(c)
+        local edge = d.Magnitude > 1 and flat(c) + d.Unit * math.min(d.Magnitude, g.Size.X / 2 - 10) or flat(c)
+        if not walkTo(Vector3.new(edge.X, g.Position.Y + 3, edge.Z), 4) and active() then
+            status("Walk to " .. (target and target.DisplayName or "the") .. "'s plot (no path from here)")
         end
     end
 
@@ -9000,12 +9150,28 @@ NC.shared = (function()
             else
                 local list = targets()
                 local held = holding()
-                if trayMax and held >= trayMax and #list > 0 then
+                -- the tray holds 21: at 21 it goes to the fridge, it never tries to take a 22nd ("Your tray is full")
+                if held >= TRAY_MAX then
                     full = true
                 end
-                if full or (#list == 0 and held > 0) then
+                -- food that is only skipped for a few seconds is still to be taken: the tray is not stored half full
+                local waiting = false
+                if #list == 0 and held > 0 and not full then
+                    local now = os.clock()
+                    for _, p in ipairs(foods) do
+                        if selected[p] and p.Parent and not unreachable[p] and badUntil[p] and badUntil[p] > now then
+                            waiting = true
+                            break
+                        end
+                    end
+                end
+                if waiting then
+                    status("Waiting to try the skipped food again (" .. held .. " on the tray)")
+                    task.wait(0.5)
+                elseif full or (#list == 0 and held > 0) then
                     if storeAll() then
                         full = false
+                        trayMax = nil
                     else
                         task.wait(1)
                     end
@@ -9041,7 +9207,15 @@ NC.shared = (function()
                     extraZone = nil
                     if not taken and active() and not unreachable[best] then
                         if why == "full" then
-                            full = true
+                            -- trayMax here: { n = tray count, p = the food refused at it }; a second, different food
+                            -- refused at the same count = the tray is full
+                            local n = holding()
+                            if type(trayMax) == "table" and trayMax.n == n and (trayMax.p ~= best or #list <= 1) then
+                                full = true
+                            else
+                                trayMax = { n = n, p = best }
+                                badUntil[best] = os.clock() + 5
+                            end
                         else
                             -- every side was tried: after 3 rounds give up on it instead of looping
                             failCount[best] = (failCount[best] or 0) + 1
@@ -9187,7 +9361,8 @@ NC.shared = (function()
         if playerFrame then
             playerFrame.Visible = #list > 0
         end
-        if target and not (target.Parent and access[target]) then
+        -- while Auto Store runs the target is kept (the loop waits for access), it never turns itself off
+        if target and not (target.Parent and access[target]) and not (storing or finishing) then
             setTarget(nil)
         end
     end
@@ -9205,23 +9380,19 @@ NC.shared = (function()
                 elseif old and not new then
                     notify(plr, "Access removed", labelFor(plr) .. " took away your access" .. (lvl and (" (now " .. levelName(lvl) .. ")") or ""))
                 end
-                if lvl or old then
+                -- no answer (permissions not loaded / the call failed) is not a removal: only a real level changes it
+                if lvl then
                     access[plr] = new
                 end
             end
         end
     end
 
+    -- access gone: Auto Store stays on and waits ("No access to that plot") until it is back
     local function onAccessLost(plr)
-        if plr == target then
-            if storing or finishing then
-                storing = false
-                finishing = false
-                stopWalk()
-                closeMenu()
-                status("Stopped: access removed")
-                setToggle(false)
-            end
+        if plr == target and (storing or finishing) then
+            stopWalk()
+            closeMenu()
         end
     end
 
@@ -9355,14 +9526,16 @@ NC.shared = (function()
                         end
                         storing = true
                         task.spawn(function()
-                            local ok, err = pcall(loop)
-                            if not ok then
-                                warn("[Legit Farm Job] auto store (shared): " .. tostring(err))
-                                status("Error, stopped")
-                            end
-                            if storing then
-                                stop("Idle")
-                                setToggle(false)
+                            -- an error never turns it off: the loop starts again until the toggle is turned off
+                            while storing and running do
+                                local ok, err = pcall(loop)
+                                if not ok then
+                                    warn("[Legit Farm Job] auto store (shared): " .. tostring(err))
+                                    status("Error, retrying")
+                                    stopWalk()
+                                    closeMenu()
+                                    task.wait(1)
+                                end
                             end
                         end)
                     elseif storing then
@@ -14394,6 +14567,1892 @@ NC.troll = (function()
     return M
 end)()
 
+-- Auto Cook (own plot). Found live: the fridge's own "Take Ingredients" (InteractionData) asks
+-- CookingUI:ShowIngredientFrame() for the pick and then sends {Type = "TakeIngredient", Name = pick._itemName}; the
+-- ingredients are equipped with FoodIngredient (the food) and CookProgress (the step done so far). Each step of the
+-- item's CookRecipe is the counter's / stove's own menu option (Stir, Cut, Mix, Garnish ... on a counter; Fry, Boil,
+-- Bake ... on a stove), done by the server while the character is attached. Steps with LeaveFood (Bake ...) leave the
+-- food in the appliance (ObjectData.CookingFood); when it is done the server adds ObjectData.TakeFoodEvent and the
+-- appliance offers "Take". The pop-ups while cooking are the game's QTE (MinigameHandler.QTE, net:HookFunction("QTE")):
+-- the answer goes through a BindableEvent the QTE module parents to itself, fired with true on a tap / key press.
+-- The finished food is put away with the fridge's own "Store".
+NC.autocook = (function()
+    local M = {}
+    local QTEMod = PlayerModules:WaitForChild("_UI"):WaitForChild("MinigameHandler"):WaitForChild("QTE")
+    -- the lock the game's own build menu shows on locked items (MainGUI.BuildMenu ... LockedLabel)
+    local LOCK_IMAGE = "rbxassetid://2826726111"
+    local autoStore = true
+    local on, gen = false, 0
+    local popupsOn = false
+    local qteConn
+    local selected = {} -- item name -> true
+    local byLabel, labelOf, foods = {}, {}, {}
+    local dropdown, statusLabel, lastStatus, toggleObj
+    local suppress = false
+    local lastSkill
+    local qty = {} -- item name -> how many to cook (default 1)
+    local runTag -- "Garden Salad 1/2" while Auto Cook runs
+    local baseStatus -- the status text without the tag (the countdown redraws it every second)
+    -- the food being cooked now: { it, total, doneBefore (step time already done), stepStart, stepDur }
+    local cooking
+
+    local function status(text)
+        baseStatus = text
+        if on and runTag then
+            text = text .. " [" .. runTag .. "]"
+        end
+        if statusLabel and text ~= lastStatus then
+            lastStatus = text
+            withUiIdentity(function()
+                statusLabel:Set("Status: " .. text)
+            end)
+        end
+    end
+
+    local function cookSkill()
+        local st = ReplicatedStorage:FindFirstChild("Stats")
+        st = st and st:FindFirstChild(LocalPlayer.Name)
+        local sd = st and st:FindFirstChild("SkillData")
+        local v = sd and sd:FindFirstChild("Cooking")
+        return v and v.Value or 0
+    end
+
+    local function needLevel(it)
+        return tonumber(it.CookSkill) or 0
+    end
+
+    -- the cooking pop-ups: answered after a short, human time (both the tap button and the key button)
+    local function updateQTE()
+        local want = popupsOn or on
+        if want and not qteConn then
+            qteConn = QTEMod.ChildAdded:Connect(function(b)
+                if b:IsA("BindableEvent") then
+                    -- answered right away: deferred so the game's QTE thread is already waiting on the event (it
+                    -- reaches Event:wait() without yielding after parenting it), fired again each frame until the QTE
+                    -- has taken it (it destroys the event then)
+                    task.defer(function()
+                        for _ = 1, 30 do
+                            if not ((popupsOn or on) and b.Parent == QTEMod) then
+                                return
+                            end
+                            pcall(function()
+                                b:Fire(true)
+                            end)
+                            RunService.Heartbeat:Wait()
+                        end
+                    end)
+                end
+            end)
+        elseif not want and qteConn then
+            qteConn:Disconnect()
+            qteConn = nil
+        end
+    end
+
+    -- Food list (the same list the fridge shows)
+    local function loadFoods()
+        table.clear(foods)
+        table.clear(byLabel)
+        table.clear(labelOf)
+        local ok = pcall(function()
+            for _, it in pairs(JobHandler.Items.CookableFoods) do
+                if it.CookRecipe and not it.IsQuickFood and not it:IsHidden(LocalPlayer) then
+                    table.insert(foods, it)
+                end
+            end
+        end)
+        if not ok then
+            return {}
+        end
+        table.sort(foods, function(a, b)
+            if needLevel(a) ~= needLevel(b) then
+                return needLevel(a) < needLevel(b)
+            end
+            return a.Name < b.Name
+        end)
+        local labels = {}
+        for _, it in ipairs(foods) do
+            local okN, n = pcall(function()
+                return JobHandler.Modules.TranslationHandler:FormatItem(it.CookName or it.Name)
+            end)
+            local label = okN and type(n) == "string" and n ~= "" and n or it.Name
+            if byLabel[label] then
+                label = it.Name
+            end
+            byLabel[label], labelOf[it.Name] = it, label
+            table.insert(labels, label)
+        end
+        return labels
+    end
+
+    local function dropdownFrame()
+        for _, root in ipairs({ gethui and gethui() or game:GetService("CoreGui"), game:GetService("CoreGui") }) do
+            local rf = root:FindFirstChild("Rayfield")
+            local el = rf and rf:FindFirstChild("Main") and rf.Main:FindFirstChild("Elements")
+            local page = el and el:FindFirstChild("Auto Cook")
+            local d = page and page:FindFirstChild("Food")
+            if d then
+                return d
+            end
+        end
+    end
+
+    -- how long one of a food takes: the game's own duration of each step of its CookRecipe (FoodService.CookActions;
+    -- "A/B" = the shorter one)
+    local function cookTime(it)
+        local total = 0
+        pcall(function()
+            local CA = JobHandler.Shared.FoodService.CookActions
+            for _, s in ipairs(it.CookRecipe or {}) do
+                local best
+                for _, n in ipairs(type(s) == "table" and s or { s }) do
+                    local d = CA[n] and CA[n].Duration
+                    if d and (not best or d < best) then
+                        best = d
+                    end
+                end
+                total += best or 0
+            end
+        end)
+        return total
+    end
+
+    local function fmtTime(s)
+        s = math.floor(s + 0.5)
+        return string.format("%d:%02d", s // 60, s % 60)
+    end
+
+    -- icon in front of every food, a lock behind the ones above the player's cooking level
+    local uiIdentity
+    local function decorate()
+        uiIdentity()
+        local frame = dropdownFrame()
+        local list = frame and frame:FindFirstChild("List")
+        if not list then
+            return
+        end
+        local skill = cookSkill()
+        for _, row in ipairs(list:GetChildren()) do
+            local it = row:IsA("Frame") and byLabel[row.Name]
+            local title = it and row:FindFirstChild("Title")
+            if it and title then
+                if not row:FindFirstChild("FoodIcon") and it.Icon then
+                    local img = Instance.new("ImageLabel")
+                    img.Name = "FoodIcon"
+                    img.BackgroundTransparency = 1
+                    img.Image = "rbxassetid://" .. tostring(it.Icon)
+                    img.Size = UDim2.fromOffset(26, 26)
+                    img.AnchorPoint = Vector2.new(0, 0.5)
+                    img.Position = UDim2.new(0, 10, 0.5, 0)
+                    img.Parent = row
+                    title.Position = UDim2.new(title.Position.X.Scale, title.Position.X.Offset + 34, title.Position.Y.Scale, title.Position.Y.Offset)
+                    title.Size = UDim2.new(title.Size.X.Scale, title.Size.X.Offset - 34, title.Size.Y.Scale, title.Size.Y.Offset)
+                end
+                -- cook time (the game's step durations, FoodService.CookActions) x quantity, and the quantity box of a
+                -- selected food
+                local timer = row:FindFirstChild("CookTimer")
+                if not timer then
+                    title.Size = UDim2.new(title.Size.X.Scale, title.Size.X.Offset - 110, title.Size.Y.Scale, title.Size.Y.Offset)
+                    timer = Instance.new("TextLabel")
+                    timer.Name = "CookTimer"
+                    timer.BackgroundTransparency = 1
+                    timer.Font = title.Font
+                    timer.TextSize = 13
+                    timer.TextColor3 = title.TextColor3
+                    timer.TextTransparency = 0.25
+                    timer.TextXAlignment = Enum.TextXAlignment.Right
+                    timer.Size = UDim2.fromOffset(70, 20)
+                    timer.AnchorPoint = Vector2.new(1, 0.5)
+                    timer.Position = UDim2.new(1, -84, 0.5, 0)
+                    timer.Parent = row
+                    local box = Instance.new("TextBox")
+                    box.Name = "CookQty"
+                    box.ZIndex = 60 -- above the row's Interact button, so a click goes into the box
+                    box.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+                    box.BorderSizePixel = 0
+                    box.Font = title.Font
+                    box.TextSize = 14
+                    box.TextColor3 = Color3.new(1, 1, 1)
+                    box.ClearTextOnFocus = false
+                    box.Text = tostring(qty[it.Name] or 1)
+                    box.Size = UDim2.fromOffset(36, 24)
+                    box.AnchorPoint = Vector2.new(1, 0.5)
+                    box.Position = UDim2.new(1, -42, 0.5, 0)
+                    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+                    local st = Instance.new("UIStroke", box)
+                    st.Color = Color3.fromRGB(90, 90, 90)
+                    st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+                    box.Parent = row
+                    box.FocusLost:Connect(function()
+                        local n = math.clamp(math.floor(tonumber(box.Text) or qty[it.Name] or 1), 1, 99)
+                        qty[it.Name] = n
+                        box.Text = tostring(n)
+                        timer.Text = fmtTime(cookTime(it) * n)
+                    end)
+                end
+                local box = row:FindFirstChild("CookQty")
+                box.Visible = selected[it.Name] == true
+                if not (cooking and cooking.it == it) then -- (the food being cooked shows its countdown)
+                    timer.Text = fmtTime(cookTime(it) * (selected[it.Name] and qty[it.Name] or 1))
+                end
+                local lock = row:FindFirstChild("LockIcon")
+                if not lock then
+                    lock = Instance.new("ImageLabel")
+                    lock.Name = "LockIcon"
+                    lock.BackgroundTransparency = 1
+                    lock.Image = LOCK_IMAGE
+                    lock.ImageColor3 = Color3.fromRGB(200, 200, 200)
+                    lock.Size = UDim2.fromOffset(22, 22)
+                    lock.AnchorPoint = Vector2.new(1, 0.5)
+                    lock.Position = UDim2.new(1, -12, 0.5, 0)
+                    lock.Parent = row
+                end
+                lock.Visible = needLevel(it) > skill
+            end
+        end
+    end
+
+    -- Walking: Humanoid:MoveTo along PathfindingService waypoints, the next waypoint taken before the current one
+    local function stopWalk()
+        local _, hum, root = getChar()
+        if hum and root then
+            hum:MoveTo(root.Position)
+        end
+    end
+
+    local function walkTo(goal, alive)
+        for _ = 1, 3 do
+            local _, hum, root = getChar()
+            if not (hum and root) or not alive() then
+                return false
+            end
+            if (flat(root.Position) - flat(goal)).Magnitude <= 2 then
+                return true
+            end
+            local wps
+            for _, cfg in ipairs(AGENT_TRIES) do
+                local p = PathfindingService:CreatePath(cfg)
+                local ok = pcall(function()
+                    p:ComputeAsync(root.Position, goal)
+                end)
+                if ok and p.Status == Enum.PathStatus.Success then
+                    wps = p:GetWaypoints()
+                    break
+                end
+            end
+            -- no path (the goal sits right at the appliance): walk straight at it
+            local pts = {}
+            if wps then
+                for i = 2, #wps do
+                    pts[#pts + 1] = wps[i].Position
+                end
+            else
+                pts[1] = goal
+            end
+            local blocked = false
+            for i, wp in ipairs(pts) do
+                hum:MoveTo(wp)
+                local r = i < #pts and 2 or 1.2
+                local ref, refT, t0 = root.Position, os.clock(), os.clock()
+                while true do
+                    if not alive() then
+                        return false
+                    end
+                    if (flat(root.Position) - flat(wp)).Magnitude <= r or (flat(root.Position) - flat(goal)).Magnitude <= 2 then
+                        break
+                    end
+                    if os.clock() - t0 > 5 then
+                        blocked = true
+                        break
+                    end
+                    if os.clock() - refT > 0.8 then
+                        if (flat(root.Position) - flat(ref)).Magnitude < 0.5 then
+                            blocked = true
+                            break
+                        end
+                        ref, refT = root.Position, os.clock()
+                    end
+                    RunService.Heartbeat:Wait()
+                end
+                if blocked or (flat(root.Position) - flat(goal)).Magnitude <= 2 then
+                    break
+                end
+            end
+            if (flat(root.Position) - flat(goal)).Magnitude <= 2.5 then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function walkToObj(obj, alive)
+        local ap = obj:FindFirstChild("AttachPos")
+        local goal = ap and ap:IsA("Attachment") and ap.WorldPosition or obj:GetPivot().Position
+        return walkTo(goal, alive)
+    end
+
+    -- The game's own menus
+    local function closeMenu()
+        pcall(function()
+            InteractionHandler:CloseMenu()
+        end)
+    end
+
+    local function plain(t)
+        return (tostring(t or ""):gsub("%[ICON:%d+%]", ""))
+    end
+
+    local function tr(key, fallback)
+        local ok, s = pcall(function()
+            return JobHandler.Modules.TranslationHandler:Format(key)
+        end)
+        return ok and type(s) == "string" and s ~= "" and s ~= key and s or fallback
+    end
+
+    local function clickMenu(obj, match)
+        if not (InteractionHandler and DataService.FireServer == origFireServer and DataService.InvokeServer == origInvokeServer) then
+            return false
+        end
+        closeMenu()
+        local ok, m = pcall(function()
+            return InteractionHandler:ShowMenu(obj)
+        end)
+        local idx
+        if ok and type(m) == "table" and type(m.Buttons) == "table" then
+            for k, v in pairs(m.Buttons) do
+                if match(plain(v.Text)) then
+                    idx = k
+                end
+            end
+        end
+        if not idx then
+            closeMenu()
+            return false
+        end
+        task.spawn(function()
+            pcall(function()
+                m:Click(idx)
+            end)
+        end)
+        return true
+    end
+
+    -- the options an object offers right now (the game's InteractionData texts, no menu opened)
+    local function options(obj)
+        local out = {}
+        pcall(function()
+            for _, g in ipairs(JobHandler.Shared.InteractionData:GetData(obj, LocalPlayer, {}) or {}) do
+                if type(g) == "function" then
+                    local okG, text = pcall(g)
+                    if okG and text then
+                        table.insert(out, plain(text))
+                    end
+                end
+            end
+        end)
+        return out
+    end
+
+    local function attached()
+        local ok, w = pcall(function()
+            return JobHandler.Shared.AttachService:GetAttachWeld(LocalPlayer.Character)
+        end)
+        return ok and w ~= nil
+    end
+
+    local function equipped()
+        local ok, e = pcall(function()
+            return JobHandler.Shared.EquipmentService:GetEquipped(LocalPlayer)
+        end)
+        return ok and e or nil
+    end
+
+    local function waitFor(cond, timeout, alive)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < timeout do
+            if cond() then
+                return true
+            end
+            task.wait(0.1)
+        end
+        return cond()
+    end
+
+    -- Kitchen objects on the player's own plot
+    local function kitchen()
+        local plots = workspace:FindFirstChild("Plots")
+        local plot = plots and plots:FindFirstChild("Plot_" .. LocalPlayer.Name)
+        local house = plot and plot:FindFirstChild("House")
+        local fridges, stations = {}, {}
+        for _, group in ipairs(house and house:GetChildren() or {}) do
+            for _, obj in ipairs(group:GetChildren()) do
+                if obj:FindFirstChild("ObjectModel") and obj:FindFirstChild("AttachPos") then
+                    local ok, it = pcall(function()
+                        return JobHandler.Items:GetItem(obj.Name)
+                    end)
+                    if ok and it then
+                        local okF, isFridge = pcall(function()
+                            return it:IsType("Fridge")
+                        end)
+                        if okF and isFridge then
+                            table.insert(fridges, obj)
+                        elseif it.Type == "Counters" or it.Type == "Appliances" then
+                            table.insert(stations, obj)
+                        end
+                    end
+                end
+            end
+        end
+        local _, _, root = getChar()
+        local function byDist(a, b)
+            return root and (a:GetPivot().Position - root.Position).Magnitude < (b:GetPivot().Position - root.Position).Magnitude
+        end
+        if root then
+            table.sort(fridges, byDist)
+            table.sort(stations, byDist)
+        end
+        return fridges[1], stations
+    end
+
+    local function stepNames(it, progress)
+        local s = it.CookRecipe and it.CookRecipe[progress + 1]
+        if s == nil then
+            return nil
+        end
+        return type(s) == "table" and s or { s }
+    end
+
+    -- 1. ingredients out of the fridge (the fridge's own "Take Ingredients"; its picker is answered with the food)
+    local function takeIngredients(fridge, it, alive)
+        local CU = JobHandler.Modules and JobHandler.Modules.CookingUI
+        local orig = type(CU) == "table" and rawget(CU, "ShowIngredientFrame")
+        if not (type(orig) == "function" and not (isexecutorclosure and isexecutorclosure(orig))) then
+            return false
+        end
+        local used = false
+        CU.ShowIngredientFrame = function()
+            used = true
+            CU.ShowIngredientFrame = orig
+            -- answered once the server has put the character at the fridge (like a player picking from the list)
+            local t0 = os.clock()
+            while not attached() and os.clock() - t0 < 3 do
+                task.wait(0.05)
+            end
+            task.wait(0.4)
+            return { _itemName = it.Name }
+        end
+        local clicked = clickMenu(fridge, function(t)
+            return t == tr("I_TakeIngredients", "Take Ingredients") or t == "Take Ingredients"
+        end)
+        if clicked then
+            waitFor(function()
+                return used
+            end, 4, alive)
+        end
+        if CU.ShowIngredientFrame ~= orig then
+            CU.ShowIngredientFrame = orig
+        end
+        closeMenu()
+        return clicked and waitFor(function()
+            local e = equipped()
+            local fi = e and e:FindFirstChild("FoodIngredient")
+            return fi ~= nil and fi.Value == it.Name and not attached()
+        end, 6, alive)
+    end
+
+    -- 2. one step of the recipe on a counter / appliance that offers it
+    local function doStep(stations, it, names, alive)
+        local wanted = {}
+        for _, n in ipairs(names) do
+            wanted[tr("I_Cooking" .. n, n)] = n
+            wanted[n] = n
+        end
+        local station, stepName
+        for _, obj in ipairs(stations) do
+            for _, t in ipairs(options(obj)) do
+                if wanted[t] then
+                    station, stepName = obj, wanted[t]
+                    break
+                end
+            end
+            if station then
+                break
+            end
+        end
+        if not station then
+            status("No counter / appliance here can " .. table.concat(names, " or ") .. " (" .. it.Name .. ")")
+            return false, "no station"
+        end
+        local action = JobHandler.Shared.FoodService.CookActions[stepName] or {}
+        status(stepName .. ": walking to the " .. station.Name)
+        if not walkToObj(station, alive) then
+            return false, "can't reach the " .. station.Name
+        end
+        local e0 = equipped()
+        local cp0 = e0 and e0:FindFirstChild("CookProgress") and e0.CookProgress.Value
+        status(stepName .. " (" .. it.Name .. ")")
+        if not clickMenu(station, function(t)
+            return wanted[t] ~= nil
+        end) then
+            return false, stepName .. " not offered"
+        end
+        local od = station:FindFirstChild("ObjectData")
+        local cf = od and od:FindFirstChild("CookingFood")
+        -- started: attached to it, or the food is left in it
+        if not waitFor(function()
+            return attached() or (cf and cf.Value ~= "") or (e0 and e0.Parent == nil)
+        end, 4, alive) then
+            closeMenu()
+            return false, stepName .. " did not start"
+        end
+        if cooking then
+            -- the countdown runs from here (the step has started) for the step's own duration
+            cooking.stepStart, cooking.stepDur = os.clock(), action.Duration or 0
+        end
+        closeMenu()
+        if attached() then
+            status(stepName .. " (" .. it.Name .. "), answering the pop-ups")
+            waitFor(function()
+                return not attached()
+            end, (action.Duration or 30) * 3 + 20, alive)
+        end
+        if cf and cf.Value ~= "" and not equipped() then
+            -- left in the appliance: taken out when it is done (the appliance adds TakeFoodEvent)
+            status(stepName .. ": waiting for the " .. it.Name .. " in the " .. station.Name)
+            if not waitFor(function()
+                return od:FindFirstChild("TakeFoodEvent") ~= nil
+            end, 600, alive) then
+                return false, stepName .. " did not finish"
+            end
+            task.wait(0.3 + math.random() * 0.3)
+            if not walkToObj(station, alive) then
+                return false, "can't reach the " .. station.Name
+            end
+            status("Taking the " .. it.Name .. " out of the " .. station.Name)
+            clickMenu(station, function(t)
+                return t == tr("I_Take", "Take") or t == "Take"
+            end)
+            waitFor(function()
+                return equipped() ~= nil and not attached()
+            end, 6, alive)
+            closeMenu()
+        end
+        -- the food comes back into the hand a moment after the step ends (seen live: nothing equipped right at the end
+        -- of a Fry)
+        local function changed()
+            local e1 = equipped()
+            local cp1 = e1 and e1:FindFirstChild("CookProgress")
+            return e1 ~= nil and e1 ~= e0 or (e1 ~= nil and (cp1 == nil or cp1.Value ~= cp0))
+        end
+        return waitFor(changed, 5, alive), stepName .. " gave nothing"
+    end
+
+    -- 3. the finished food into the fridge (the fridge's own "Store")
+    local function storeFood(fridge, alive)
+        status("Walking to the " .. fridge.Name)
+        if not walkToObj(fridge, alive) then
+            return false
+        end
+        status("Storing the food")
+        clickMenu(fridge, function(t)
+            return t == tr("I_Store", "Store") or t == "Store"
+        end)
+        local ok = waitFor(function()
+            return equipped() == nil and not attached()
+        end, 8, alive)
+        closeMenu()
+        return ok
+    end
+
+    local function cookOne(it, alive)
+        local fridge, stations = kitchen()
+        if not fridge then
+            status("No fridge found on your plot")
+            return false
+        end
+        if needLevel(it) > cookSkill() then
+            status(it.Name .. " is locked (cooking level " .. needLevel(it) .. ")")
+            return false
+        end
+        local e = equipped()
+        local fi = e and e:FindFirstChild("FoodIngredient")
+        -- already holding this food (its ingredients, or the cooked food itself) goes on from there
+        if e and not (fi and fi.Value == it.Name) and not (tostring(e) == it.Name and not e:FindFirstChild("CookProgress")) then
+            status("Put away what you are holding first")
+            return false
+        end
+        if not e then
+            status("Walking to the " .. fridge.Name)
+            if not walkToObj(fridge, alive) then
+                status("Can't reach the " .. fridge.Name)
+                return false
+            end
+            status("Taking the " .. it.Name .. " ingredients")
+            if not takeIngredients(fridge, it, alive) then
+                if alive() then
+                    status("Could not take the " .. it.Name .. " ingredients (money / level?)")
+                end
+                return false
+            end
+        end
+        for _ = 1, 12 do
+            if not alive() then
+                return false
+            end
+            e = equipped()
+            local cp = e and e:FindFirstChild("CookProgress")
+            if not e then
+                return false
+            end
+            if not cp then
+                break -- cooked
+            end
+            local names = stepNames(it, cp.Value)
+            if not names then
+                break
+            end
+            local ok, why = doStep(stations, it, names, alive)
+            if cooking and cooking.stepStart then
+                cooking.doneBefore += cooking.stepDur
+                cooking.stepStart = nil
+            end
+            if not ok then
+                if alive() then
+                    status(it.Name .. ": " .. tostring(why))
+                end
+                return false
+            end
+            task.wait(0.3 + math.random() * 0.3)
+        end
+        e = equipped()
+        if not (e and not e:FindFirstChild("CookProgress")) then
+            return false
+        end
+        if not autoStore then
+            return true, "kept"
+        end
+        return storeFood(fridge, alive)
+    end
+
+    local function setToggle(v)
+        if toggleObj then
+            suppress = true
+            withUiIdentity(function()
+                toggleObj:Set(v)
+            end)
+            suppress = false
+        end
+    end
+
+    function M.stop(text)
+        on = false
+        gen += 1
+        updateQTE()
+        closeMenu()
+        stopWalk()
+        status(text or "Idle")
+        if cooking then
+            cooking = nil
+            pcall(decorate) -- the countdown row shows its cook time again
+        end
+    end
+
+    function M.start()
+        if on then
+            return
+        end
+        -- each selected food as many times as its quantity, in list order (Garden Salad x2, then Gelatin Cake x5 ...)
+        local list, nth = {}, {}
+        for _, it in ipairs(foods) do
+            if selected[it.Name] then
+                local n = qty[it.Name] or 1
+                for k = 1, n do
+                    table.insert(list, it)
+                    nth[#list] = k .. "/" .. n
+                end
+            end
+        end
+        if #list == 0 then
+            status("Select food first")
+            setToggle(false)
+            return
+        end
+        on = true
+        gen += 1
+        local myGen = gen
+        local function alive()
+            return running and on and gen == myGen
+        end
+        updateQTE()
+        task.spawn(function()
+            local ok, err = pcall(function()
+                local done, failed, kept = 0, 0, nil
+                for i, it in ipairs(list) do
+                    if not alive() then
+                        return
+                    end
+                    local tag = it.Name .. " " .. nth[i]
+                    cooking = { it = it, total = cookTime(it), doneBefore = 0 }
+                    local cur = cooking
+                    runTag = tag .. ", " .. fmtTime(cur.total) .. " left"
+                    -- live countdown: time left on this food (runs while a step is cooking, holds while walking),
+                    -- on its row in the list and in the status; it stops at 0:00 when the food is done
+                    task.spawn(function()
+                        while alive() and cooking == cur do
+                            local used = cur.doneBefore
+                            if cur.stepStart then
+                                used += math.min(os.clock() - cur.stepStart, cur.stepDur)
+                            end
+                            local text = fmtTime(math.max(cur.total - used, 0)) .. " left"
+                            runTag = tag .. ", " .. text
+                            pcall(function()
+                                uiIdentity()
+                                local frame = dropdownFrame()
+                                local row = frame and frame.List:FindFirstChild(labelOf[it.Name] or "")
+                                local timer = row and row:FindFirstChild("CookTimer")
+                                if timer then
+                                    timer.Text = text
+                                end
+                            end)
+                            if baseStatus then
+                                status(baseStatus)
+                            end
+                            task.wait(0.25)
+                        end
+                    end)
+                    local ok, how = cookOne(it, alive)
+                    cooking = nil
+                    pcall(decorate) -- the row shows its cook time again
+                    if ok then
+                        done += 1
+                        if how == "kept" then
+                            -- Auto Store off: the food stays in hand, and no more ingredients can be taken while holding it
+                            kept = it
+                            break
+                        end
+                    else
+                        failed += 1
+                        task.wait(2)
+                    end
+                end
+                if alive() then
+                    if kept then
+                        M.stop("Done: " .. kept.Name .. " cooked, in your hand (Auto Store is off)"
+                            .. (#list > done + failed and ", the rest needs Auto Store on" or ""))
+                    else
+                        M.stop(("Done: %d cooked and stored%s"):format(done, failed > 0 and (", " .. failed .. " not") or ""))
+                    end
+                    setToggle(false)
+                end
+            end)
+            if not ok then
+                warn("[Legit Farm Job] auto cook: " .. tostring(err))
+                if gen == myGen then
+                    M.stop("Error, stopped")
+                    setToggle(false)
+                end
+            end
+        end)
+    end
+
+    function M.shutdown()
+        popupsOn = false
+        if on then
+            M.stop()
+        end
+        on = false
+        gen += 1
+        updateQTE()
+    end
+
+    -- the game calls that build the food list drop this thread's identity; Rayfield needs it back
+    function uiIdentity()
+        if setIdentity and UI_IDENTITY then
+            pcall(setIdentity, UI_IDENTITY)
+        end
+    end
+
+    function M.buildUI(tab)
+        local labels = loadFoods()
+        uiIdentity()
+        tab:CreateSection("Auto Cook")
+        dropdown = tab:CreateDropdown({
+            Name = "Food",
+            Options = labels,
+            CurrentOption = {},
+            MultipleOptions = true,
+            Flag = "LFJ_CookFood",
+            Callback = function(option)
+                local opts = type(option) == "table" and option or { option }
+                table.clear(selected)
+                for _, l in ipairs(opts) do
+                    local it = byLabel[l]
+                    if it then
+                        selected[it.Name] = true
+                    end
+                end
+                pcall(decorate) -- quantity boxes on the selected foods
+            end,
+        })
+        toggleObj = tab:CreateToggle({
+            Name = "Auto Cook",
+            CurrentValue = false,
+            Flag = "LFJ_AutoCook",
+            Callback = function(v)
+                if suppress then
+                    return
+                end
+                if v then
+                    M.start()
+                elseif on then
+                    M.stop("Idle")
+                end
+            end,
+        })
+        tab:CreateToggle({
+            Name = "Auto Store",
+            CurrentValue = true,
+            Flag = "LFJ_CookAutoStore",
+            Callback = function(v)
+                autoStore = v
+            end,
+        })
+        statusLabel = tab:CreateLabel("Status: Idle")
+        tab:CreateSection("Cooking pop-ups")
+        tab:CreateToggle({
+            Name = "Auto Complete Cooking Popups",
+            CurrentValue = false,
+            Flag = "LFJ_CookPopups",
+            Callback = function(v)
+                popupsOn = v
+                updateQTE()
+            end,
+        })
+        decorate()
+        -- the locks follow the cooking level
+        task.spawn(function()
+            while running do
+                local s = cookSkill()
+                if s ~= lastSkill then
+                    lastSkill = s
+                    pcall(decorate)
+                end
+                task.wait(2)
+            end
+        end)
+    end
+
+    return M
+end)()
+
+-- BFF Supermarket - Cashier (job id SupermarketCashier). Found live in the game's own JobHandler.SupermarketCashier
+-- module: the registers are Environment.Locations.City.Supermarket.Interior.CashierWorkstations ("Workstation" x4); the
+-- shift starts by itself when the character walks into the register area. Per register: BagHolder ("I_Take" = TakeNewBag,
+-- "I_Restock" = RestockBags while holding "BFF Bags" and BagsLeft is 0), Bags (a bag on the counter is open when its
+-- Transparency is 0; the game lets an item be scanned while an open bag has 3 children or fewer), DroppedFood (the
+-- customer's items, "I_Scan" = ScanDroppedItem), Display.Screen.CashierGUI.Frame.Done (its Activated = the game's done()),
+-- Occupied (the customer; Status "" while placing, "placed" when every item is down, ScannedObjects / PlacedObjects).
+-- The bag boxes are Supermarket.Geometry.Crates "BagCrate" ("I_Take" = TakeNewBags with empty hands).
+NC.market = (function()
+    local K = {}
+    local JOB = "SupermarketCashier"
+    local station -- the one register of this shift
+    local outerSetStatus = setStatus
+    local function setStatus(text)
+        if farming then
+            outerSetStatus(text)
+        end
+    end
+
+    local function alive()
+        return running and farming
+    end
+
+    local function pause(a, b)
+        local t = a + math.random() * (b - a)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < t do
+            task.wait(0.03)
+        end
+    end
+
+    local function waitUntil(cond, timeout)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < timeout do
+            if cond() then
+                return true
+            end
+            task.wait(0.05)
+        end
+        return cond()
+    end
+
+    local function market()
+        local env = workspace:FindFirstChild("Environment")
+        local n = env
+        for _, name in ipairs({ "Locations", "City", "Supermarket" }) do
+            n = n and n:FindFirstChild(name)
+        end
+        return n
+    end
+
+    -- the game's own interaction callback of an object (only the game's closures, checked like every other job)
+    local function callback(obj, wanted)
+        local reg = getInteractRegistry()
+        local entry = reg and obj and reg[obj]
+        local gens = entry and entry[1]
+        for _, gen in ipairs(type(gens) == "table" and gens or {}) do
+            if type(gen) == "function" then
+                local ok, text, _, cb = pcall(gen)
+                if ok and text == wanted and type(cb) == "function" then
+                    return cb
+                end
+            end
+        end
+    end
+
+    local function use(cb)
+        if not cleanSafe(cb) then
+            farming = false
+            if FarmToggle then
+                withUiIdentity(function()
+                    FarmToggle:Set(false)
+                end)
+            end
+            outerSetStatus("Stopped: unsafe supermarket state")
+            return false
+        end
+        pcall(cb)
+        return true
+    end
+
+    local function floorAt(x, z, y)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ignore = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        params.FilterDescendantsInstances = ignore
+        local h = workspace:Raycast(Vector3.new(x, y + 6, z), Vector3.new(0, -14, 0), params)
+        return h and h.Position
+    end
+
+    -- the cashier's spot: on the far side of the scanner from the customers (live: register 1 scanner 491.6,-710.8,
+    -- customers at x 487-488, the shift started walking in at 497,-713)
+    local function standOf(w)
+        local scanner = w:FindFirstChild("Scanner")
+        local cust = w:FindFirstChild("CustomerTarget_2") or w:FindFirstChild("CustomerTarget_1")
+        if not (scanner and cust) then
+            return nil
+        end
+        local d = Vector3.new(scanner.Position.X - cust.Position.X, 0, scanner.Position.Z - cust.Position.Z)
+        d = d.Magnitude > 0.1 and d.Unit or Vector3.new(1, 0, 0)
+        local p = scanner.Position + d * 3.6
+        return floorAt(p.X, p.Z, scanner.Position.Y) or Vector3.new(p.X, scanner.Position.Y - 1.9, p.Z)
+    end
+
+    local function takenByOther(w)
+        local u = w:FindFirstChild("InUse") and w.InUse.Value
+        if typeof(u) == "Instance" and u ~= LocalPlayer and u.Parent == Players then
+            return true
+        end
+        local sp = standOf(w)
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local r = plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r and sp and (Vector3.new(r.Position.X, 0, r.Position.Z) - Vector3.new(sp.X, 0, sp.Z)).Magnitude < 4 then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- one of the 4 registers at random (a free one), kept for the whole shift
+    local function pickStation()
+        local sm = market()
+        local ws = sm and sm:FindFirstChild("Interior") and sm.Interior:FindFirstChild("CashierWorkstations")
+        local free = {}
+        for _, w in ipairs(ws and ws:GetChildren() or {}) do
+            if w:FindFirstChild("BagHolder") and w:FindFirstChild("DroppedFood") and not takenByOther(w) then
+                table.insert(free, w)
+            end
+        end
+        if #free == 0 then
+            return nil
+        end
+        return free[math.random(#free)]
+    end
+
+    local function flatDist(a, b)
+        return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+    end
+
+    -- walking: the script's own walkTo (Humanoid:MoveTo along pathfinding waypoints, the next waypoint taken before
+    -- the current one is reached, so it does not stop and start)
+    local function walk(goal)
+        for _ = 1, 3 do
+            if not alive() then
+                return false
+            end
+            local _, _, root = getChar()
+            if root and flatDist(root.Position, goal) < 2 then
+                return true
+            end
+            if walkTo(goal) then
+                return true
+            end
+            task.wait(0.3)
+        end
+        local _, _, root = getChar()
+        return root ~= nil and flatDist(root.Position, goal) < 3
+    end
+
+    local function openBag(w)
+        for _, b in ipairs(w.Bags:GetChildren()) do
+            if b.Transparency == 0 and #b:GetChildren() <= 3 then
+                return b
+            end
+        end
+    end
+
+    local function equippedName()
+        local ok, e = pcall(function()
+            return JobHandler.Shared.EquipmentService:GetEquipped(LocalPlayer)
+        end)
+        return ok and e and tostring(e) or nil
+    end
+
+    -- the register is out of bags: the BAGS boxes ("BagCrate"), Take, back to the register, Restock
+    local function refill(w, stand)
+        local sm = market()
+        local crates = sm and sm:FindFirstChild("Geometry") and sm.Geometry:FindFirstChild("Crates")
+        local _, _, root = getChar()
+        if not (crates and root) then
+            return false
+        end
+        if equippedName() ~= "BFF Bags" then
+            local list = {}
+            for _, c in ipairs(crates:GetChildren()) do
+                if c.Name == "BagCrate" then
+                    table.insert(list, { c = c, d = (c:GetPivot().Position - root.Position).Magnitude })
+                end
+            end
+            table.sort(list, function(a, b)
+                return a.d < b.d
+            end)
+            local got = false
+            for _, e in ipairs(list) do
+                if not alive() or got then
+                    break
+                end
+                local p = e.c:GetPivot().Position
+                setStatus("Out of bags: walking to the BAGS boxes")
+                for _, off in ipairs({ { 0, 3.5 }, { 3.5, 0 }, { -3.5, 0 }, { 0, -3.5 }, { 0, 5 }, { 5, 0 }, { -5, 0 }, { 0, -5 } }) do
+                    local spot = floorAt(p.X + off[1], p.Z + off[2], p.Y)
+                    if spot and math.abs(spot.Y - root.Position.Y + 3) < 2.5 and walk(spot) then
+                        local cb = callback(e.c, "I_Take")
+                        if cb then
+                            setStatus("Taking bags")
+                            pause(0.2, 0.4)
+                            if not use(cb) then
+                                return false
+                            end
+                            got = waitUntil(function()
+                                return equippedName() == "BFF Bags"
+                            end, 3)
+                        end
+                        break
+                    end
+                end
+            end
+            if not got then
+                setStatus("Could not take bags, trying again")
+                return false
+            end
+        end
+        setStatus("Bringing the bags to the register")
+        if not walk(stand) then
+            return false
+        end
+        local before = w.BagsLeft.Value
+        local cb
+        waitUntil(function()
+            cb = callback(w.BagHolder, "I_Restock")
+            return cb ~= nil
+        end, 3)
+        if not cb then
+            return false
+        end
+        setStatus("Restocking the bags")
+        pause(0.2, 0.4)
+        if not use(cb) then
+            return false
+        end
+        return waitUntil(function()
+            return w.BagsLeft.Value > before
+        end, 4)
+    end
+
+    function K.step()
+        if not farming then
+            task.wait(0.3)
+            return
+        end
+        local _, hum, root = getChar()
+        if not hum then
+            setStatus("Waiting for character")
+            task.wait(1)
+            return
+        end
+        if not (station and station.Parent) then
+            station = pickStation()
+            if not station then
+                setStatus("No free register, waiting")
+                task.wait(1.5)
+                return
+            end
+        end
+        local w = station
+        local stand = standOf(w)
+        if not stand then
+            setStatus("Register not found, waiting")
+            task.wait(1)
+            return
+        end
+        if flatDist(root.Position, stand) > 3 then
+            setStatus("Walking to the register")
+            if not walk(stand) then
+                setStatus("Can't reach the register, retrying")
+                task.wait(1)
+            end
+            return
+        end
+        if not isWorkingJob(JOB) then
+            -- the shift starts by itself at the register
+            setStatus("Starting the shift at the register")
+            waitUntil(function()
+                return isWorkingJob(JOB)
+            end, 3)
+            return
+        end
+        local npc = w.Occupied.Value
+        local items = w.DroppedFood:GetChildren()
+        if w.BagsLeft.Value < 1 and not openBag(w) then
+            if not refill(w, stand) then
+                task.wait(1)
+            end
+            return
+        end
+        if not npc then
+            setStatus("Waiting for customer")
+            task.wait(0.3)
+            return
+        end
+        local st = npc:FindFirstChild("Status")
+        if not st then
+            task.wait(0.2)
+            return
+        end
+        if #items > 0 then
+            -- 1. a bag (again when the open one is full: 3 items)
+            if not openBag(w) then
+                local cb = callback(w.BagHolder, "I_Take")
+                if not cb then
+                    setStatus("Waiting for a bag")
+                    task.wait(0.3)
+                    return
+                end
+                setStatus("Taking a bag")
+                if not use(cb) then
+                    return
+                end
+                waitUntil(function()
+                    return openBag(w) ~= nil
+                end, 3)
+                pause(0.35, 0.6)
+                return
+            end
+            -- 2. scan the items one by one, at a person's pace
+            local scanned = st:FindFirstChild("ScannedObjects")
+            local before = scanned and scanned.Value or 0
+            for _, item in ipairs(items) do
+                local cb = item.Parent and callback(item, "I_Scan")
+                if cb then
+                    setStatus("Scanning " .. item.Name)
+                    if not use(cb) then
+                        return
+                    end
+                    waitUntil(function()
+                        return item.Parent == nil or (scanned and scanned.Value > before)
+                    end, 3)
+                    pause(0.45, 0.75)
+                    return
+                end
+            end
+            task.wait(0.2)
+            return
+        end
+        -- 3. every item scanned and the customer has put everything down: Done
+        local placed = st:FindFirstChild("PlacedObjects")
+        local scanned = st:FindFirstChild("ScannedObjects")
+        if st.Value == "placed" and placed and scanned and scanned.Value >= placed.Value then
+            local done = w.Display:FindFirstChild("Screen") and w.Display.Screen:FindFirstChild("CashierGUI")
+            done = done and done:FindFirstChild("Frame") and done.Frame:FindFirstChild("Done")
+            local ok, conns = pcall(getconnections, done and done.Activated)
+            local fn = ok and conns and conns[1] and conns[1].Function
+            if not fn then
+                task.wait(0.3)
+                return
+            end
+            pause(0.4, 0.7)
+            setStatus("Pressing Done")
+            if not cleanSafe(fn) then
+                use(fn) -- (stops Auto Farm with the unsafe status)
+                return
+            end
+            task.spawn(function()
+                pcall(fn)
+            end)
+            waitUntil(function()
+                return w.Occupied.Value ~= npc or st.Value == "true" or st.Value == "false"
+            end, 4)
+            if st.Value == "false" then
+                warn("[Legit Farm Job] supermarket: the order was not accepted")
+                setStatus("Order not accepted, next customer")
+            else
+                setStatus("Order done")
+            end
+            waitUntil(function()
+                return w.Occupied.Value ~= npc
+            end, 6)
+            return
+        end
+        setStatus("Waiting for the customer to put everything down")
+        task.wait(0.2)
+    end
+
+    function K.stop()
+        station = nil
+    end
+
+    return K
+end)()
+
+-- Hairdresser - Stylez Hair Studio (job id StylezHairdresser). Found live in the game's own JobHandler.StylezHairdresser:
+-- stations Environment.Locations.City.StylezHairStudio.Interior.HairdresserWorkstations ("Workstation" x4: Stool, Mirror,
+-- Occupied, InUse); the shift starts by itself when the character walks from the waiting area to a station. Each Mirror has
+-- the HairdresserGUI.Frame with Style.Next / Style.Back, Color.Next / Color.Back and Done (their Activated = the game's
+-- doAction). doAction's own upvalues hold the current customer, the sorted style list (StylezHairAssets.Styles, 10), the
+-- sorted color list (StylezHairAssets.Colors, 8) and the current pick {style, color}. The request is the customer's speech
+-- bubble: ChatBubble.Body.IconFrame[" "] has a style Icon (an image) and a color Icon (image 2132263837, tinted with the
+-- color). The colour is matched by its tint; the style icons are not linked to the styles anywhere on the client, so they
+-- were matched by sight (3 seen) and the rest is learned from the game's own answer (Order "true" / "false"), kept in
+-- getgenv and in the file LFJ_HairIcons.json.
+NC.hair = (function()
+    local H = {}
+    local JOB = "StylezHairdresser"
+    local COLOR_ICON = "2132263837"
+    local station
+    local outerSetStatus = setStatus
+    local function setStatus(text)
+        if farming then
+            outerSetStatus(text)
+        end
+    end
+
+    local function alive()
+        return running and farming
+    end
+
+    local function pause(a, b)
+        local t = a + math.random() * (b - a)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < t do
+            task.wait(0.03)
+        end
+    end
+
+    local function waitUntil(cond, timeout)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < timeout do
+            if cond() then
+                return true
+            end
+            task.wait(0.05)
+        end
+        return cond()
+    end
+
+    -- style icon -> style name (seen and matched live), plus whatever was learned from the game's answers
+    local HttpService = game:GetService("HttpService")
+    local FILE = "LFJ_HairIcons.json"
+    local known = getgenv().LFJ_HairIcons
+    if type(known) ~= "table" then
+        known = { map = {}, wrong = {} }
+        pcall(function()
+            if isfile and isfile(FILE) then
+                local t = HttpService:JSONDecode(readfile(FILE))
+                if type(t) == "table" and type(t.map) == "table" then
+                    known = { map = t.map, wrong = type(t.wrong) == "table" and t.wrong or {} }
+                end
+            end
+        end)
+        getgenv().LFJ_HairIcons = known
+    end
+    -- all 10 (3 matched by sight, 7 learned live from the game's answers; every one confirmed by an accepted haircut)
+    for id, name in pairs({
+        ["2134784092"] = "Afro", ["2134784330"] = "Bun", ["2134784513"] = "Charming", ["2134922767"] = "Combed",
+        ["2134784698"] = "Curly", ["2134784889"] = "Headband", ["2134785130"] = "Long", ["2134785777"] = "Messy",
+        ["2134785997"] = "Pigtails", ["2134786236"] = "Sideswept",
+    }) do
+        known.map[id] = known.map[id] or name
+    end
+
+    local function saveKnown()
+        pcall(function()
+            if writefile then
+                writefile(FILE, HttpService:JSONEncode(known))
+            end
+        end)
+    end
+
+    local function studio()
+        local n = workspace:FindFirstChild("Environment")
+        for _, name in ipairs({ "Locations", "City", "StylezHairStudio" }) do
+            n = n and n:FindFirstChild(name)
+        end
+        return n
+    end
+
+    local function frameOf(w)
+        local gui = w:FindFirstChild("Mirror") and w.Mirror:FindFirstChild("HairdresserGUI")
+        return gui and gui:FindFirstChild("Frame")
+    end
+
+    -- the game's handler of a button (its Activated connection), only the game's own closure
+    local function buttonFn(btn)
+        local ok, conns = pcall(getconnections, btn and btn.Activated)
+        local c = ok and conns and conns[1]
+        return c and c.Function
+    end
+
+    -- the game's doAction state: current customer, style list, color list, current pick
+    local function stateOf(w)
+        local f = frameOf(w)
+        local fn = buttonFn(f and f:FindFirstChild("Done"))
+        if not fn then
+            return nil
+        end
+        local okU, ups = pcall(debug.getupvalues, fn)
+        local doAction
+        for _, v in pairs(okU and ups or {}) do
+            if type(v) == "function" then
+                doAction = v
+            end
+        end
+        if not doAction then
+            return nil
+        end
+        local st = {}
+        for _, v in pairs(debug.getupvalues(doAction)) do
+            if type(v) == "table" then
+                if #v == 2 and type(v[1]) == "number" and type(v[2]) == "number" then
+                    st.pick = v
+                elseif typeof(v[1]) == "Instance" and v[1].Parent then
+                    if v[1].Parent.Name == "Styles" then
+                        st.styles = v
+                    elseif v[1].Parent.Name == "Colors" then
+                        st.colors = v
+                    end
+                end
+            elseif typeof(v) == "Instance" and v.Name:find("Customer") then
+                st.customer = v
+            end
+        end
+        if st.pick and st.styles and st.colors then
+            return st
+        end
+    end
+
+    local function floorAt(x, z, y)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ignore = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        params.FilterDescendantsInstances = ignore
+        local h = workspace:Raycast(Vector3.new(x, y + 6, z), Vector3.new(0, -14, 0), params)
+        return h and h.Position
+    end
+
+    -- the hairdresser's spot: 3.5 studs behind the customer's stool (away from the mirror the customer faces)
+    local function standOf(w)
+        local stool, mirror = w:FindFirstChild("Stool"), w:FindFirstChild("Mirror")
+        if not (stool and mirror) then
+            return nil
+        end
+        local s = stool:GetPivot().Position
+        local d = Vector3.new(s.X - mirror.Position.X, 0, s.Z - mirror.Position.Z)
+        d = d.Magnitude > 0.1 and d.Unit or Vector3.new(0, 0, -1)
+        local p = s + d * 3.5
+        return floorAt(p.X, p.Z, s.Y) or Vector3.new(p.X, s.Y - 2, p.Z)
+    end
+
+    local function flatDist(a, b)
+        return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+    end
+
+    local function takenByOther(w)
+        local u = w:FindFirstChild("InUse") and w.InUse.Value
+        if typeof(u) == "Instance" and u ~= LocalPlayer and u.Parent == Players then
+            return true
+        end
+        local sp = standOf(w)
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local r = plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r and sp and flatDist(r.Position, sp) < 4 then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function pickStation()
+        local s = studio()
+        local ws = s and s:FindFirstChild("Interior") and s.Interior:FindFirstChild("HairdresserWorkstations")
+        local free = {}
+        for _, w in ipairs(ws and ws:GetChildren() or {}) do
+            -- (the mirror's HairdresserGUI only exists once the shift has started, so it is not required here)
+            if w:FindFirstChild("Mirror") and w:FindFirstChild("Stool") and w:FindFirstChild("Occupied") and not takenByOther(w) then
+                table.insert(free, w)
+            end
+        end
+        -- a customer already sitting and waiting (e.g. after Auto Farm was off and the job left): that station first
+        for _, w in ipairs(free) do
+            local npc = w.Occupied.Value
+            local o = npc and npc:FindFirstChild("Order")
+            if o and o.Value == "" then
+                return w
+            end
+        end
+        return #free > 0 and free[math.random(#free)] or nil
+    end
+
+    -- one continuous walk through all the given points (bottom opening, middle, station spot): every leg is planned
+    -- first (PathfindingService), the waypoints are joined into one line, and the character follows it with
+    -- Humanoid:MoveTo toward a point a little ahead on that line, so it never stops at a leg's end or a waypoint.
+    -- Only when it makes no headway (stuck) is the rest planned again from where it is.
+    local HAIR_AGENTS = {
+        { AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = false },
+        { AgentRadius = 1, AgentHeight = 5, AgentCanJump = false },
+    }
+    local function walkVia(points, retarget)
+        for _ = 1, 3 do
+            if not alive() then
+                return false
+            end
+            local _, hum, root = getChar()
+            if not (hum and root) then
+                return false
+            end
+            local goal = points[#points]
+            if flatDist(root.Position, goal) < 1.5 then
+                return true
+            end
+            -- plan every remaining leg
+            local line, from = { root.Position }, root.Position
+            local legEnd = {}
+            for li, g in ipairs(points) do
+                legEnd[li] = #line
+                if flatDist(from, g) > 1 then
+                    local path
+                    for _, cfg in ipairs(HAIR_AGENTS) do
+                        local p = PathfindingService:CreatePath(cfg)
+                        local ok = pcall(function()
+                            p:ComputeAsync(from, g)
+                        end)
+                        if ok and p.Status == Enum.PathStatus.Success then
+                            path = p
+                            break
+                        end
+                    end
+                    if not path then
+                        return false
+                    end
+                    for i, wp in ipairs(path:GetWaypoints()) do
+                        if i > 1 then
+                            line[#line + 1] = wp.Position
+                        end
+                    end
+                    from = g
+                end
+                legEnd[li] = #line
+            end
+            -- follow the line: aim 3 studs ahead of the character's place on it
+            local seg, stuck = 1, false
+            local ref, refT = root.Position, os.clock()
+            local lastAim, lastMoveT, lastCheck = nil, 0, os.clock()
+            while alive() do
+                local p = root.Position
+                if flatDist(p, goal) <= 1.2 then
+                    break
+                end
+                -- the customer sat at another station while walking: that walk starts at once, still moving (no stop)
+                if retarget and os.clock() - lastCheck > 0.25 then
+                    lastCheck = os.clock()
+                    if retarget() then
+                        return "retarget"
+                    end
+                end
+                while seg < #line - 1 do
+                    local a, b = line[seg], line[seg + 1]
+                    local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                    local l2 = ab:Dot(ab)
+                    local t = l2 > 1e-6 and Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2 or 1
+                    if t >= 1 or flatDist(p, b) <= 1.5 then
+                        seg += 1
+                    else
+                        break
+                    end
+                end
+                local a, b = line[seg], line[seg + 1] or line[seg]
+                local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                local l2 = ab:Dot(ab)
+                local t = l2 > 1e-6 and math.clamp(Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2, 0, 1) or 1
+                local cur, left, aim = a:Lerp(b, t), 3, line[#line]
+                local k = seg
+                while k < #line do
+                    local nxt = line[k + 1]
+                    local d = flatDist(cur, nxt)
+                    if d >= left then
+                        aim = cur:Lerp(nxt, d > 1e-6 and left / d or 1)
+                        break
+                    end
+                    left -= d
+                    cur = nxt
+                    k += 1
+                end
+                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5 then
+                    hum:MoveTo(aim)
+                    lastAim, lastMoveT = aim, os.clock()
+                end
+                if os.clock() - refT > 0.9 then
+                    if flatDist(p, ref) < 0.5 then
+                        stuck = true
+                        break
+                    end
+                    ref, refT = p, os.clock()
+                end
+                RunService.Heartbeat:Wait()
+            end
+            if not alive() then
+                return false
+            end
+            if not stuck then
+                -- the last 1.2 studs onto the spot itself
+                hum:MoveTo(goal)
+                local t0 = os.clock()
+                while alive() and os.clock() - t0 < 1.5 and flatDist(root.Position, goal) > 0.8 do
+                    RunService.Heartbeat:Wait()
+                end
+                return true
+            end
+            -- stuck: the legs not yet finished are planned again from here
+            local rest = {}
+            for li, g in ipairs(points) do
+                if legEnd[li] > seg then
+                    rest[#rest + 1] = g
+                end
+            end
+            points = #rest > 0 and rest or { goal }
+        end
+        local _, _, root = getChar()
+        return root ~= nil and flatDist(root.Position, points[#points]) < 3
+    end
+
+    -- the request in the customer's bubble: style icon id, color tint
+    local function readRequest(npc)
+        local head = npc and npc:FindFirstChild("Head")
+        -- every bubble on the head (seen live after leaving and coming back: a leftover bubble without the icons next
+        -- to the game's new one), else the customer's own icon frame
+        local f
+        for _, b in ipairs(head and head:GetChildren() or {}) do
+            if b.Name == "ChatBubble" then
+                f = b:FindFirstChild(" ", true)
+                if f then
+                    break
+                end
+            end
+        end
+        f = f or (npc and npc:FindFirstChild(" "))
+        if not f then
+            return nil
+        end
+        local styleId, tint
+        for _, ic in ipairs(f:GetChildren()) do
+            if ic:IsA("ImageLabel") and ic.Visible then
+                local id = tostring(ic.Image):match("%d+")
+                if id == COLOR_ICON then
+                    tint = ic.ImageColor3
+                elseif id then
+                    styleId = id
+                end
+            end
+        end
+        if styleId and tint then
+            return styleId, tint
+        end
+    end
+
+    local function colorIndex(colors, tint)
+        local best, bd
+        for i, c in ipairs(colors) do
+            local v = c.Value.Color
+            local d = math.abs(v.R - tint.R) + math.abs(v.G - tint.G) + math.abs(v.B - tint.B)
+            if not bd or d < bd then
+                best, bd = i, d
+            end
+        end
+        return best
+    end
+
+    -- the style for an icon: known, or the first style not yet tied to another icon and not already wrong for it
+    local function styleIndex(styles, iconId)
+        local name = known.map[iconId]
+        if not name then
+            local used = {}
+            for _, n in pairs(known.map) do
+                used[n] = true
+            end
+            local wrong = known.wrong[iconId] or {}
+            for _, s in ipairs(styles) do
+                if not used[s.Name] and not wrong[s.Name] then
+                    name = s.Name
+                    break
+                end
+            end
+            if not name then
+                for _, s in ipairs(styles) do
+                    if not wrong[s.Name] then
+                        name = s.Name
+                        break
+                    end
+                end
+            end
+        end
+        for i, s in ipairs(styles) do
+            if s.Name == name then
+                return i, known.map[iconId] ~= nil
+            end
+        end
+        return 1, false
+    end
+
+    local function press(btn)
+        local fn = buttonFn(btn)
+        if not fn then
+            return false
+        end
+        if not cleanSafe(fn) then
+            farming = false
+            if FarmToggle then
+                withUiIdentity(function()
+                    FarmToggle:Set(false)
+                end)
+            end
+            outerSetStatus("Stopped: unsafe hairdresser state")
+            return false
+        end
+        task.spawn(function()
+            pcall(fn)
+        end)
+        return true
+    end
+
+    -- arrows to the wanted index (the shorter way round), at a person's pace
+    local function cycle(w, group, which, want)
+        local f = frameOf(w)
+        local g = f and f:FindFirstChild(group)
+        for _ = 1, 15 do
+            if not alive() then
+                return false
+            end
+            local st = stateOf(w)
+            if not st then
+                return false
+            end
+            local cur, n = st.pick[which], which == 1 and #st.styles or #st.colors
+            if cur == want then
+                return true
+            end
+            local fwd = (want - cur) % n
+            local btn = g and g:FindFirstChild(fwd <= n - fwd and "Next" or "Back")
+            if not press(btn) then
+                return false
+            end
+            waitUntil(function()
+                local s2 = stateOf(w)
+                return s2 and s2.pick[which] ~= cur
+            end, 1)
+            pause(0.3, 0.5)
+        end
+        local st = stateOf(w)
+        return st ~= nil and st.pick[which] == want
+    end
+
+    function H.step()
+        if not farming then
+            task.wait(0.3)
+            return
+        end
+        local _, hum, root = getChar()
+        if not hum then
+            setStatus("Waiting for character")
+            task.wait(1)
+            return
+        end
+        if not (station and station.Parent) then
+            station = pickStation()
+            if not station then
+                setStatus("No free station, waiting")
+                task.wait(1.5)
+                return
+            end
+        end
+        -- the customer sits where the game sends it, not always at the station picked (seen: walking through the middle
+        -- sent one to station 2 while station 4 was picked): with nobody at this station, a customer waiting at another
+        -- station no other player works is served there instead
+        local function switchToCustomer()
+            if station.Occupied.Value then
+                return false
+            end
+            local ws = station.Parent
+            for i, other in ipairs(ws and ws:GetChildren() or {}) do
+                local npc2 = other ~= station and other:FindFirstChild("Occupied") and other.Occupied.Value
+                local o2 = npc2 and npc2:FindFirstChild("Order")
+                if o2 and o2.Value == "" and other:FindFirstChild("Mirror") and other:FindFirstChild("Stool") and not takenByOther(other) then
+                    station = other
+                    setStatus("Customer at station " .. i .. ", going there")
+                    return true
+                end
+            end
+            return false
+        end
+        switchToCustomer()
+        local w = station
+        local stand = standOf(w)
+        if not stand then
+            setStatus("Station not found, waiting")
+            task.wait(1)
+            return
+        end
+        if flatDist(root.Position, stand) > 2.5 then
+            setStatus("Walking to the station")
+            -- seen live: the waiting area is behind a partition (x ~ -60, z -324..-340) with an opening at each end; the
+            -- path finder takes the top one, which runs past station 4's drawer, and the character got stuck there
+            -- (-64,-319.5) every time. So from the waiting side it walks through the bottom opening (-61,-343) and the
+            -- open middle of the studio (Interior.Floor's centre); every station's spot faces the middle
+            local s = studio()
+            local fl = s and s:FindFirstChild("Interior") and s.Interior:FindFirstChild("Floor")
+            local mid = fl and floorAt(fl.Position.X, fl.Position.Z, stand.Y + 1)
+            local via = {}
+            if root.Position.X > -60 then
+                local gate = floorAt(-61, -343, stand.Y + 1)
+                if gate then
+                    via[#via + 1] = gate
+                end
+            end
+            if mid and flatDist(root.Position, mid) > 3 then
+                via[#via + 1] = mid
+            end
+            via[#via + 1] = stand
+            -- (one continuous walk, no stop at the opening or the middle)
+            if not walkVia(via, switchToCustomer) then
+                setStatus("Can't reach the station, retrying")
+                task.wait(1)
+            end
+            return
+        end
+        if not isWorkingJob(JOB) then
+            setStatus("Starting the shift at the station")
+            waitUntil(function()
+                return isWorkingJob(JOB)
+            end, 3)
+            return
+        end
+        local npc = w.Occupied.Value
+        local order = npc and npc:FindFirstChild("Order")
+        if not (npc and order and order.Value == "") then
+            setStatus("Waiting for customer")
+            task.wait(0.3)
+            return
+        end
+        local st = stateOf(w)
+        local styleId, tint = readRequest(npc)
+        if not (st and st.customer == npc and styleId and tint) then
+            setStatus("Reading the request")
+            task.wait(0.2)
+            return
+        end
+        local ci = colorIndex(st.colors, tint)
+        local si, sure = styleIndex(st.styles, styleId)
+        local styleName, colorName = st.styles[si].Name, st.colors[ci].Name
+        setStatus("Request: " .. styleName .. (sure and "" or " (trying)") .. ", " .. colorName)
+        pause(0.4, 0.7)
+        if not cycle(w, "Style", 1, si) then
+            task.wait(0.5)
+            return
+        end
+        pause(0.2, 0.4)
+        if not cycle(w, "Color", 2, ci) then
+            task.wait(0.5)
+            return
+        end
+        pause(0.4, 0.7)
+        if not (npc.Parent and order.Value == "" and w.Occupied.Value == npc) then
+            return
+        end
+        setStatus("Pressing Done")
+        local f = frameOf(w)
+        if not press(f and f:FindFirstChild("Done")) then
+            return
+        end
+        waitUntil(function()
+            return order.Value ~= "" or w.Occupied.Value ~= npc
+        end, 5)
+        if order.Value == "true" then
+            if not known.map[styleId] then
+                known.map[styleId] = styleName
+                saveKnown()
+            end
+            setStatus("Haircut done")
+        elseif order.Value == "false" then
+            if not known.map[styleId] then
+                known.wrong[styleId] = known.wrong[styleId] or {}
+                known.wrong[styleId][styleName] = true
+                saveKnown()
+            elseif known.map[styleId] == styleName then
+                warn("[Legit Farm Job] hairdresser: " .. styleName .. " / " .. colorName .. " was not accepted")
+            end
+            setStatus("Haircut not accepted, next customer")
+        end
+        waitUntil(function()
+            return w.Occupied.Value ~= npc
+        end, 6)
+    end
+
+    function H.stop()
+        station = nil
+    end
+
+    return H
+end)()
+
 local hookConns = {}
 local function hook(name, fn)
     local ok, handle = pcall(function()
@@ -14532,7 +16591,8 @@ local function farmLoop()
         local ok, err = pcall(selectedJob == JANITOR_NAME and janitorStep or selectedJob == TAXI_NAME and taxiStep
             or selectedJob == ICE_NAME and iceStep or selectedJob == CASH_NAME and cashStep
             or selectedJob == "Fast Food Worker - Burger Cook" and NC.cook.step or selectedJob == PIZZA_NAME and NC.pizza.step
-            or selectedJob == TEACHER_NAME and NC.teacher.step or farmStep)
+            or selectedJob == TEACHER_NAME and NC.teacher.step or selectedJob == "BFF Supermarket" and NC.market.step
+            or selectedJob == "Hairdresser - Stylez Hair Studio" and NC.hair.step or farmStep)
         if not ok then
             warn("[Legit Farm Job] " .. tostring(err))
             setStatus("Error, retrying")
@@ -14546,7 +16606,7 @@ end
 -- UI
 JobsTab:CreateDropdown({
     Name = "Select Job",
-    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME },
+    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio" },
     CurrentOption = {},
     MultipleOptions = false,
     Flag = "LFJ_Job",
@@ -14619,6 +16679,8 @@ FarmToggle = JobsTab:CreateToggle({
             pcall(NC.cook.stop)
             pcall(NC.pizza.stop)
             pcall(NC.teacher.stop)
+            pcall(NC.market.stop)
+            pcall(NC.hair.stop)
             if selectedJob ~= "Fast Food Worker - Burger Cook" then
                 stopWalking()
             end
@@ -14714,11 +16776,14 @@ PlotTab:CreateButton({
     end,
 })
 
+-- tab order: Jobs, Plot, Mood Station, Auto Store (NC.store.buildUI), Auto Cook, Halloween Event, Troll
+NC.store.buildUI()
+
+NC.autocook.buildUI(Window:CreateTab("Auto Cook", "chef-hat"))
+
 local HalloweenTab = Window:CreateTab("Halloween Event", "ghost")
 NC.seasonal.buildUI(HalloweenTab)
 NC.ghunt.buildUI(HalloweenTab)
-
-NC.store.buildUI()
 
 NC.troll.buildUI(Window:CreateTab("Troll", "skull"))
 
@@ -14757,10 +16822,13 @@ getgenv().LegitFarmJob = function()
     pcall(NC.cook.stop)
     pcall(NC.pizza.stop)
     pcall(NC.teacher.stop)
+    pcall(NC.market.stop)
+    pcall(NC.hair.stop)
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
     pcall(NC.troll.shutdown)
+    pcall(NC.autocook.shutdown)
     pcall(NC.mood.shutdown)
     pcall(NC.store.shutdown)
     pcall(NC.shared.shutdown)
