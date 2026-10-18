@@ -5764,13 +5764,66 @@ NC.cook = (function()
         end
     end
 
+    -- finished burger -> when it appeared on the board
+    local burgerSeen = setmetatable({}, { __mode = "k" })
+
     local function deliver(st, burger)
         local ai = aiOf(st)
         local ft = ai:FindFirstChild("FinishedTarget")
-        if not (ft and burger.Parent and grab(st, burger)) then
+        if not (ft and burger.Parent) then
             return false, "could not pick up the burger"
         end
-        dropInto(st, burger, ft, false)
+        -- seen live (the burger left on the board): a burger picked up 0.6 s after it appeared had its drag ended by the game
+        -- at once and fell loose on the board, not on the hand-in spot, and the popup still green from the burger before
+        -- counted it as handed in. So: picked up 0.8 s after it appeared at the earliest (the old pace that worked; the
+        -- game keeps it Anchored until it is picked up, so that is no signal), and handed in only when it really sits on the
+        -- hand-in spot (FinishedTarget) - else picked up again
+        local function onSpot()
+            return burger.Parent == ft or (burger.Parent ~= nil and burger.Parent.Name == "Order Content")
+        end
+        for try = 1, 3 do
+            local seen = burgerSeen[burger]
+            while seen and alive() and burger.Parent and not onSpot() and os.clock() - seen < 0.8 do
+                task.wait(0.03)
+            end
+            if not (burger.Parent and grab(st, burger)) then
+                return false, "could not pick up the burger"
+            end
+            -- the hand-in spot sits in a cubby walled on 3 sides ("Sepreating Wall"), open toward its own board (where the
+            -- character stands): live, a straight diagonal line caught the burger on the end of the wall between the two
+            -- cubbies, it hung there until the move timed out and was dropped next to the spot. So it is first brought in
+            -- front of the opening, then straight in
+            local rel = ft.CFrame:VectorToObjectSpace(st.AttachPosition - ft.Position)
+            local out = math.abs(rel.X) > math.abs(rel.Z) and ft.CFrame.RightVector * math.sign(rel.X)
+                or ft.CFrame.LookVector * -math.sign(rel.Z)
+            local entry = snapPos(burger, ft, false) + out * 1.4
+            local from = burger.Position
+            local te = os.clock()
+            while alive() and burger.Parent and os.clock() - te < 0.6 do
+                local a = math.min((os.clock() - te) / 0.2, 1)
+                aim = { part = ft, pos = from:Lerp(entry, a * a * (3 - 2 * a)) }
+                if a >= 1 and (burger.Position - entry).Magnitude < 0.35 then
+                    break
+                end
+                RunService.Heartbeat:Wait()
+            end
+            moveObj(burger, ft, false)
+            pause(0.12, 0.28)
+            local held = DS:GetDraggedObject() == burger
+            dropObj(st)
+            pause(0.1, 0.25)
+            local ts = os.clock()
+            while held and alive() and burger.Parent and not onSpot() and os.clock() - ts < 1.5 do
+                task.wait(0.05)
+            end
+            if onSpot() or not burger.Parent or not alive() then
+                break
+            end
+            warn("[Legit Farm Job] cook: the burger fell next to the hand-in spot (try " .. try .. "), it is picked up again")
+        end
+        if burger.Parent and not onSpot() then
+            return false, "the burger is not on the hand-in spot"
+        end
         local t0 = os.clock()
         local sawGreen, sawRed = false, false
         while alive() and os.clock() - t0 < 15 do
@@ -5778,7 +5831,7 @@ NC.cook = (function()
                 progress()
                 return true
             end
-            local c = popupColor(st)
+            local c = burger.Parent == ft and popupColor(st)
             if c == "green" then
                 sawGreen = true
             elseif c == "red" then
@@ -5972,6 +6025,7 @@ NC.cook = (function()
             for _, b in ipairs(leftoverBurgers(ai)) do
                 if not before[b] then
                     burger = b
+                    burgerSeen[b] = burgerSeen[b] or os.clock()
                     break
                 end
             end
@@ -17258,6 +17312,166 @@ NC.seasonal.buildUI(HalloweenTab)
 NC.ghunt.buildUI(HalloweenTab)
 
 NC.troll.buildUI(Window:CreateTab("Troll", "skull"))
+
+-- Theme tab: Rayfield's own Window.ModifyTheme(theme table / name) recolors the open window (background, top bar, tabs,
+-- elements, toggles, sliders, dropdowns, text). The window was made without a theme = Rayfield's "Default".
+NC.theme = (function()
+    local T = {}
+    local function themed(over)
+        local base = {}
+        for k, v in pairs(type(Rayfield.Theme) == "table" and Rayfield.Theme.Default or {}) do
+            base[k] = v
+        end
+        for k, v in pairs(over) do
+            base[k] = v
+        end
+        return base
+    end
+    local rgb = Color3.fromRGB
+    -- one dark, slightly tinted base, quiet outlines, and a single accent for what is on / selected
+    -- Christmas: pine base, wine-red top bar, cranberry accent, snow-white selected tab, a thin gold ring on toggles that
+    -- are on
+    local CHRISTMAS = themed({
+        TextColor = rgb(238, 234, 224),
+        Background = rgb(12, 26, 20), Topbar = rgb(96, 22, 32), Shadow = rgb(5, 12, 9),
+        NotificationBackground = rgb(12, 26, 20), NotificationActionsBackground = rgb(238, 234, 224),
+        TabBackground = rgb(20, 40, 31), TabStroke = rgb(36, 62, 49), TabBackgroundSelected = rgb(238, 234, 224),
+        TabTextColor = rgb(200, 212, 204), SelectedTabTextColor = rgb(96, 22, 32),
+        ElementBackground = rgb(18, 36, 28), ElementBackgroundHover = rgb(23, 44, 35),
+        SecondaryElementBackground = rgb(15, 31, 24), ElementStroke = rgb(34, 58, 46), SecondaryElementStroke = rgb(27, 48, 38),
+        SliderBackground = rgb(92, 28, 36), SliderProgress = rgb(191, 45, 58), SliderStroke = rgb(214, 76, 88),
+        ToggleBackground = rgb(14, 29, 22), ToggleEnabled = rgb(191, 45, 58), ToggleDisabled = rgb(66, 84, 75),
+        ToggleEnabledStroke = rgb(214, 76, 88), ToggleDisabledStroke = rgb(86, 104, 95),
+        ToggleEnabledOuterStroke = rgb(196, 164, 98), ToggleDisabledOuterStroke = rgb(36, 60, 48),
+        DropdownSelected = rgb(28, 54, 42), DropdownUnselected = rgb(18, 36, 28),
+        InputBackground = rgb(14, 29, 22), InputStroke = rgb(40, 66, 53), PlaceholderColor = rgb(140, 156, 147),
+    })
+    -- Halloween: ash-black base, burnt-pumpkin top bar, pumpkin accent, a dim violet ring on toggles that are on
+    local HALLOWEEN = themed({
+        TextColor = rgb(236, 226, 212),
+        Background = rgb(16, 14, 17), Topbar = rgb(64, 30, 10), Shadow = rgb(7, 6, 8),
+        NotificationBackground = rgb(16, 14, 17), NotificationActionsBackground = rgb(240, 126, 36),
+        TabBackground = rgb(26, 22, 28), TabStroke = rgb(40, 34, 43), TabBackgroundSelected = rgb(240, 126, 36),
+        TabTextColor = rgb(196, 186, 178), SelectedTabTextColor = rgb(28, 16, 6),
+        ElementBackground = rgb(24, 21, 26), ElementBackgroundHover = rgb(30, 26, 33),
+        SecondaryElementBackground = rgb(19, 17, 21), ElementStroke = rgb(39, 33, 43), SecondaryElementStroke = rgb(31, 27, 35),
+        SliderBackground = rgb(98, 48, 16), SliderProgress = rgb(240, 126, 36), SliderStroke = rgb(255, 158, 72),
+        ToggleBackground = rgb(18, 16, 20), ToggleEnabled = rgb(240, 126, 36), ToggleDisabled = rgb(72, 66, 78),
+        ToggleEnabledStroke = rgb(255, 158, 72), ToggleDisabledStroke = rgb(92, 85, 99),
+        ToggleEnabledOuterStroke = rgb(112, 74, 140), ToggleDisabledOuterStroke = rgb(40, 35, 45),
+        DropdownSelected = rgb(36, 30, 40), DropdownUnselected = rgb(24, 21, 26),
+        InputBackground = rgb(18, 16, 20), InputStroke = rgb(46, 39, 51), PlaceholderColor = rgb(150, 140, 150),
+    })
+
+    -- Rayfield's ChangeTheme leaves some parts in the old colours (found in its source): the tab buttons (only coloured
+    -- when made / clicked), sliders, dropdown option rows, and it gives labels the element colour instead of the label
+    -- colour. Those are repainted here with the same theme keys Rayfield uses for them.
+    local current = type(Rayfield.Theme) == "table" and Rayfield.Theme.Default or nil
+    local function repaint(th, prev)
+        local rf
+        for _, root in ipairs({ gethui and gethui() or game:GetService("CoreGui"), game:GetService("CoreGui") }) do
+            rf = rf or root:FindFirstChild("Rayfield")
+        end
+        local main = rf and rf:FindFirstChild("Main")
+        if not (main and main:FindFirstChild("Elements") and main:FindFirstChild("TabList")) then
+            return
+        end
+        local isDefault = type(Rayfield.Theme) == "table" and th == Rayfield.Theme.Default
+        local page = main.Elements:FindFirstChildOfClass("UIPageLayout")
+        local cur = page and page.CurrentPage
+        for _, b in ipairs(main.TabList:GetChildren()) do
+            if b:IsA("Frame") and b.Name ~= "Template" and b:FindFirstChild("Title") then
+                local sel = cur ~= nil and cur.Name == b.Name
+                b.BackgroundColor3 = sel and th.TabBackgroundSelected or th.TabBackground
+                b.Title.TextColor3 = sel and th.SelectedTabTextColor or th.TabTextColor
+                if b:FindFirstChild("Image") then
+                    b.Image.ImageColor3 = sel and th.SelectedTabTextColor or th.TabTextColor
+                end
+                if b:FindFirstChild("UIStroke") then
+                    b.UIStroke.Color = th.TabStroke
+                end
+            end
+        end
+        for _, pg in ipairs(main.Elements:GetChildren()) do
+            for _, el in ipairs(pg:GetChildren()) do
+                if el:IsA("Frame") then
+                    if el.Name == "Label" and el:FindFirstChild("UIStroke") then
+                        el.BackgroundColor3 = th.SecondaryElementBackground
+                        el.UIStroke.Color = th.SecondaryElementStroke
+                    end
+                    local m = el:FindFirstChild("Main")
+                    if m and m:FindFirstChild("Progress") then
+                        m.BackgroundColor3 = th.SliderBackground
+                        if m:FindFirstChild("UIStroke") then
+                            m.UIStroke.Color = th.SliderStroke
+                        end
+                        m.Progress.BackgroundColor3 = th.SliderProgress
+                        if m.Progress:FindFirstChild("UIStroke") then
+                            m.Progress.UIStroke.Color = th.SliderStroke
+                        end
+                        if m:FindFirstChild("Shadow") then
+                            m.Shadow.Visible = isDefault
+                        end
+                    end
+                    local sw = el:FindFirstChild("Switch")
+                    if sw and sw:FindFirstChild("Shadow") and isDefault then
+                        sw.Shadow.Visible = true
+                    end
+                    local list = el:FindFirstChild("List")
+                    if list then
+                        for _, o in ipairs(list:GetChildren()) do
+                            if o:IsA("Frame") and o.Name ~= "Template" and o.Name ~= "Placeholder" then
+                                local wasSel = prev ~= nil and o.BackgroundColor3 == prev.DropdownSelected
+                                o.BackgroundColor3 = wasSel and th.DropdownSelected or th.DropdownUnselected
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function apply(theme)
+        withUiIdentity(function()
+            local th = type(theme) == "table" and theme or (type(Rayfield.Theme) == "table" and Rayfield.Theme[theme])
+            Window.ModifyTheme(theme)
+            if th then
+                local prev = current
+                current = th
+                task.delay(0.1, function()
+                    withUiIdentity(function()
+                        repaint(th, prev)
+                    end)
+                end)
+            end
+        end)
+    end
+
+    function T.buildUI(tab)
+        tab:CreateSection("Theme")
+        tab:CreateButton({
+            Name = "Christmas Theme",
+            Callback = function()
+                apply(CHRISTMAS)
+            end,
+        })
+        tab:CreateButton({
+            Name = "Halloween Theme",
+            Callback = function()
+                apply(HALLOWEEN)
+            end,
+        })
+        tab:CreateButton({
+            Name = "Revert to Original Theme",
+            Callback = function()
+                apply("Default")
+            end,
+        })
+    end
+
+    return T
+end)()
+NC.theme.buildUI(Window:CreateTab("Theme", "palette"))
 
 -- Anti AFK
 NC.afk = (function()
