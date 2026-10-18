@@ -15939,10 +15939,27 @@ NC.hair = (function()
         return c and c.Function
     end
 
+    -- mobile (the game's InputManager:GetInputType() is not "Default", seen live on Delta: "Touch"): the mirror's buttons
+    -- get no handlers; the game registers a job interaction on the Workstation model instead, "T_ChangeHair" (Style_Next),
+    -- "T_ChangeHairColor" (Color_Next), "B_Done" (Done), each callback calling the same doAction. Only used when the
+    -- mirror's Done button has no handler, so PC is unchanged.
+    local function mobileCb(w, key)
+        local reg = getInteractRegistry()
+        local entry = reg and reg[w]
+        for _, gen in ipairs(type(entry) == "table" and type(entry[1]) == "table" and entry[1] or {}) do
+            if type(gen) == "function" then
+                local ok, text, _, cb = pcall(gen)
+                if ok and text == key and type(cb) == "function" then
+                    return cb
+                end
+            end
+        end
+    end
+
     -- the game's doAction state: current customer, style list, color list, current pick
     local function stateOf(w)
         local f = frameOf(w)
-        local fn = buttonFn(f and f:FindFirstChild("Done"))
+        local fn = buttonFn(f and f:FindFirstChild("Done")) or mobileCb(w, "B_Done")
         if not fn then
             return nil
         end
@@ -16254,8 +16271,8 @@ NC.hair = (function()
         return 1, false
     end
 
-    local function press(btn)
-        local fn = buttonFn(btn)
+    local function press(btn, mobileFn)
+        local fn = buttonFn(btn) or mobileFn
         if not fn then
             return false
         end
@@ -16293,7 +16310,9 @@ NC.hair = (function()
             end
             local fwd = (want - cur) % n
             local btn = g and g:FindFirstChild(fwd <= n - fwd and "Next" or "Back")
-            if not press(btn) then
+            -- mobile: no button handlers, only the game's "Next" interaction (forward only)
+            local mob = not buttonFn(btn) and mobileCb(w, group == "Style" and "T_ChangeHair" or "T_ChangeHairColor") or nil
+            if not press(btn, mob) then
                 return false
             end
             waitUntil(function()
@@ -16420,7 +16439,7 @@ NC.hair = (function()
         end
         setStatus("Pressing Done")
         local f = frameOf(w)
-        if not press(f and f:FindFirstChild("Done")) then
+        if not press(f and f:FindFirstChild("Done"), mobileCb(w, "B_Done")) then
             return
         end
         waitUntil(function()
