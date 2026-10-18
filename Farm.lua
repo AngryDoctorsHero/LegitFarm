@@ -15856,6 +15856,9 @@ NC.hair = (function()
     local JOB = "StylezHairdresser"
     local COLOR_ICON = "2132263837"
     local station
+    -- set once the character stands at its station with the shift running: from then on it stays there (a customer at
+    -- another station, e.g. one sent there by another player starting a shift, no longer moves it)
+    local locked = false
     local outerSetStatus = setStatus
     local function setStatus(text)
         if farming then
@@ -16337,6 +16340,7 @@ NC.hair = (function()
             return
         end
         if not (station and station.Parent) then
+            locked = false
             station = pickStation()
             if not station then
                 setStatus("No free station, waiting")
@@ -16346,9 +16350,10 @@ NC.hair = (function()
         end
         -- the customer sits where the game sends it, not always at the station picked (seen: walking through the middle
         -- sent one to station 2 while station 4 was picked): with nobody at this station, a customer waiting at another
-        -- station no other player works is served there instead
+        -- station no other player works is served there instead - only on the way in, before the character has settled
+        -- at its station
         local function switchToCustomer()
-            if station.Occupied.Value then
+            if locked or station.Occupied.Value then
                 return false
             end
             local ws = station.Parent
@@ -16405,6 +16410,7 @@ NC.hair = (function()
             end, 3)
             return
         end
+        locked = true
         local npc = w.Occupied.Value
         local order = npc and npc:FindFirstChild("Order")
         if not (npc and order and order.Value == "") then
@@ -16468,6 +16474,7 @@ NC.hair = (function()
 
     function H.stop()
         station = nil
+        locked = false
     end
 
     return H
