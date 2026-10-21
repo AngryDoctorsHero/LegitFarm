@@ -4769,27 +4769,29 @@ NC.cook = (function()
         params.FilterType = Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = ignore
         local from = Vector3.new(x, y + 1, z)
-        for _ = 1, 8 do
+        for i = 1, 8 do
             local hit = workspace:Raycast(from, Vector3.new(0, -30, 0), params)
             if not hit then
                 return nil
             end
             if hit.Position.Y <= top then
-                return hit.Position
+                return hit.Position, i == 1 -- (second value: open floor, nothing above it)
             end
             from = hit.Position - Vector3.new(0, 0.1, 0)
         end
     end
 
-    local function walkNear(pos)
+    -- openOnly: only spots with nothing above them. Seen live (restocking the patties at Frying_02): the first spot tried
+    -- (3 studs behind the bin) was floor under the station's "Shell" at 5.8; walking there climbed onto the grill
+    local function walkNear(pos, openOnly)
         local _, _, root = getChar()
         if not root then
             return false
         end
         local char = LocalPlayer.Character
         for _, o in ipairs({ { 0, 3 }, { 0, -3 }, { 3, 0 }, { -3, 0 }, { 0, 5 }, { 5, 0 }, { -5, 0 }, { 0, -5 }, { 2, 2 }, { -2, -2 } }) do
-            local floor = groundBelow(pos.X + o[1], pos.Y + 3, pos.Z + o[2], { char })
-            if floor and inKitchenArea(floor, 0) then
+            local floor, open = groundBelow(pos.X + o[1], pos.Y + 3, pos.Z + o[2], { char })
+            if floor and inKitchenArea(floor, 0) and (open or not openOnly) then
                 walkAgents = COOK_AGENTS
                 local ok = walkTo(floor, true)
                 walkAgents = nil
@@ -4990,7 +4992,26 @@ NC.cook = (function()
         end
         local anchor = rs:FindFirstChild("Interaction")
         local pos = anchor and anchor:IsA("BasePart") and anchor.Position or rs:GetPivot().Position
-        walkNear(pos)
+        -- the patties: on the open floor in front of the bin, as far out from the counter as the cook stands at the grill
+        -- (live: Frying_02 bin 199.9,307.2 -> 199.9,302.7), never beside / onto the grill
+        local front = false
+        if st.RootName == "Frying" then
+            pcall(function()
+                local ap, lt = st.AttachPosition, st.LookTarget
+                local L = Vector3.new(lt.Position.X - ap.X, 0, lt.Position.Z - ap.Z).Unit
+                local spot = Vector3.new(pos.X, 0, pos.Z) - L * Vector3.new(pos.X - ap.X, 0, pos.Z - ap.Z):Dot(L)
+                local floor, open = groundBelow(spot.X, pos.Y + 3, spot.Z, { LocalPlayer.Character })
+                if floor and open then
+                    walkAgents = COOK_AGENTS
+                    front = walkTo(floor, true)
+                    walkAgents = nil
+                end
+            end)
+            walkAgents = nil
+        end
+        if not front then
+            walkNear(pos, st.RootName == "Frying") -- (the patties: only on the open floor, never onto the grill)
+        end
         local cb
         for _ = 1, 6 do
             cb = callbackFor(rs, "I_Restock")
@@ -5781,6 +5802,29 @@ NC.cook = (function()
         local function onSpot()
             return burger.Parent == ft or (burger.Parent ~= nil and burger.Parent.Name == "Order Content")
         end
+        -- which column of the board's 4 spots it was built on, seen from the character (live: Assembly_02 T1 / T2 left,
+        -- T3 / T4 right; the hand-in cubby is on the left column's side). Built on a left spot it goes straight into the
+        -- cubby; built on a right spot it first goes in front of the opening (the little hop), as before
+        local leftSide = false
+        pcall(function()
+            local root = burger
+            while root.Parent and root.Parent ~= ai do
+                root = root.Parent
+            end
+            local ap, lt = st.AttachPosition, st.LookTarget
+            local f = typeof(lt) == "Instance" and Vector3.new(lt.Position.X - ap.X, 0, lt.Position.Z - ap.Z) or Vector3.zero
+            if root.Parent == ai and root.Name == "Target" and f.Magnitude > 0.1 then
+                local right = f.Unit:Cross(Vector3.yAxis)
+                local sum, n = 0, 0
+                for _, t in ipairs(ai:GetChildren()) do
+                    if t.Name == "Target" and t:IsA("BasePart") then
+                        sum += (t.Position - ap):Dot(right)
+                        n += 1
+                    end
+                end
+                leftSide = n > 0 and (root.Position - ap):Dot(right) < sum / n
+            end
+        end)
         for try = 1, 3 do
             local seen = burgerSeen[burger]
             while seen and alive() and burger.Parent and not onSpot() and os.clock() - seen < 0.8 do
@@ -5799,7 +5843,7 @@ NC.cook = (function()
             local entry = snapPos(burger, ft, false) + out * 1.4
             local from = burger.Position
             local te = os.clock()
-            while alive() and burger.Parent and os.clock() - te < 0.6 do
+            while not (leftSide and try == 1) and alive() and burger.Parent and os.clock() - te < 0.6 do
                 local a = math.min((os.clock() - te) / 0.2, 1)
                 aim = { part = ft, pos = from:Lerp(entry, a * a * (3 - 2 * a)) }
                 if a >= 1 and (burger.Position - entry).Magnitude < 0.35 then
@@ -6133,6 +6177,40 @@ NC.cook = (function()
         return false
     end
 
+    -- full batches, the order the player's own account (munchlaxlv100) worked in, watched live for 12 minutes
+    local PATTY_FULL, CHOP_FULL, SIDE_FULL = 5, 10, 3
+    local function fillFry(S, wants)
+        for _, name in ipairs({ "Meat Patty [Cooked]", "Plantbased Patty [Cooked]" }) do
+            local need = PATTY_FULL - amountOf(S.asm, name)
+            local raw = (name:gsub("%[Cooked%]", "[Raw]"))
+            if need > (wants[raw] or 0) then
+                wants[raw] = need
+            end
+        end
+    end
+
+    local function fillChop(S, wants)
+        for _, name in ipairs({ "Lettuce [Chopped]", "Tomato [Chopped]", "Onion [Chopped]" }) do
+            local raws = math.floor((CHOP_FULL - amountOf(S.asm, name)) / 2)
+            local raw = (name:gsub("%[Chopped%]", "[Raw]"))
+            if raws > (wants[raw] or 0) then
+                wants[raw] = raws
+            end
+        end
+    end
+
+    local function sideStations(lc, idx)
+        local S = {
+            asm = stationOf(lc, "Assembly", idx),
+            chop = stationOf(lc, "Chopping", idx),
+            fry = stationOf(lc, "Frying", idx),
+            deep = stationOf(lc, "DeepFrying", idx),
+        }
+        if S.asm and S.chop and S.fry and S.deep then
+            return S
+        end
+    end
+
     local function planSide(lc, idx)
         local S = {
             asm = stationOf(lc, "Assembly", idx),
@@ -6209,8 +6287,24 @@ NC.cook = (function()
         for name, n in pairs(sideNeed) do
             local deficit = n - amountOf(S.deep, name .. " [Ready]")
             if deficit > 0 then
-                pl.fryRawWants[name] = deficit
-                pl.rawWants[name .. " [Raw]"] = deficit
+                -- a full fryer batch (the player's own account put 3 of a side in at once)
+                local want = math.max(deficit, SIDE_FULL - amountOf(S.deep, name .. " [Ready]"))
+                pl.fryRawWants[name] = want
+                pl.rawWants[name .. " [Raw]"] = want
+            end
+        end
+        -- full batches when it is cooking / chopping anyway (the player's own account: 5 meat + 5 plant-based patties on
+        -- the grill, every vegetable chopped up to ~10), instead of only what these orders still need
+        if next(pl.fryWants) then
+            fillFry(S, pl.fryWants)
+        end
+        if next(pl.chopWants) then
+            fillChop(S, pl.chopWants)
+        end
+        pl.asmWants = {}
+        for name, n in pairs(tot) do
+            if name:find("Bun") or name:find("Cheese") then
+                pl.asmWants[name] = n
             end
         end
         return pl
@@ -6260,27 +6354,7 @@ NC.cook = (function()
         if not alive() then
             return false
         end
-        -- 3. the sides that are ready go on the trays
-        for _, o in ipairs(batch) do
-            if not alive() then
-                return false
-            end
-            if o.needSide then
-                local ok, why = deliverSide(lc, S.deep, o)
-                if not ok then
-                    if why == "taken" then
-                        problem("Deep-Fry", why)
-                        task.wait(1)
-                        return false
-                    end
-                    failed(o)
-                end
-            end
-        end
-        if not alive() then
-            return false
-        end
-        -- 4. buns / cheese, then the burgers
+        -- 3. buns / cheese, then every burger of this side (the player's own account: all burgers first, then the sides)
         local asmWants = {}
         for name, n in pairs(tot) do
             if name:find("Bun") or name:find("Cheese") then
@@ -6306,6 +6380,26 @@ NC.cook = (function()
                     setStatus("Burger problem (" .. tostring(why) .. ")")
                     failed(o)
                     task.wait(0.5)
+                end
+            end
+        end
+        if not alive() then
+            return false
+        end
+        -- 4. then the sides that are ready go on the trays
+        for _, o in ipairs(batch) do
+            if not alive() then
+                return false
+            end
+            if o.needSide then
+                local ok, why = deliverSide(lc, S.deep, o)
+                if not ok then
+                    if why == "taken" then
+                        problem("Deep-Fry", why)
+                        task.wait(1)
+                        return false
+                    end
+                    failed(o)
                 end
             end
         end
@@ -6383,6 +6477,38 @@ NC.cook = (function()
             table.insert(names, table.concat(n, ", "))
         end
         setStatus("Orders: " .. table.concat(names, " | "))
+        -- the other side's grill / chopping board right after this side's (the player's own account: Frying_01 then
+        -- Frying_02, Chopping_01 then Chopping_02), when nobody else works that side
+        local other
+        if #active == 1 then
+            local oi = active[1].idx == 1 and 2 or 1
+            local OS = taken[oi] == 0 and sideStations(lc, oi)
+            if OS then
+                other = { idx = oi, S = OS, fryWants = {}, chopWants = {}, fryRawWants = {}, rawWants = {}, asmWants = {} }
+                if next(active[1].fryWants) then
+                    fillFry(OS, other.fryWants)
+                end
+                if next(active[1].chopWants) then
+                    fillChop(OS, other.chopWants)
+                end
+            end
+        end
+        -- every station that needs a box, one box after another in one trip first (the player carried box after box)
+        local trip = {}
+        for _, pl in ipairs(other and { active[1], other } or active) do
+            for _, e in ipairs({ { pl.S.fry, pl.fryWants, "the Frying station" }, { pl.S.deep, pl.rawWants, "the Deep-Fry station" },
+                { pl.S.chop, pl.chopWants, "the Chopping station" }, { pl.S.asm, pl.asmWants, "the Assembly station" } }) do
+                if next(e[2]) and needRestock(e[1], e[2]) then
+                    table.insert(trip, e)
+                end
+            end
+        end
+        for _, e in ipairs(trip) do
+            if not alive() then
+                return
+            end
+            restock(lc, e[1], e[3])
+        end
         local anyFry = false
         for _, pl in ipairs(active) do
             if next(pl.fryWants) and needRestock(pl.S.fry, pl.fryWants) and not restock(lc, pl.S.fry, "the Frying station") then
@@ -6402,11 +6528,37 @@ NC.cook = (function()
             end
         end
         if anyFry then
-            local ok, why = fryAll(lc, active)
+            local fryPlans = active
+            if other and next(other.fryWants) and not needRestock(other.S.fry, other.fryWants) then
+                fryPlans = { active[1], other }
+            end
+            local ok, why = fryAll(lc, fryPlans)
             if not ok then
                 problem("Frying", why)
                 task.wait(1)
                 return
+            end
+        end
+        -- the vegetables of this side, then the other side's board right after, then the burgers and sides
+        if other and next(other.chopWants) and next(active[1].chopWants) and not needRestock(other.S.chop, other.chopWants) then
+            if not alive() then
+                return
+            end
+            local okC = true
+            if needRestock(active[1].S.chop, active[1].chopWants) then
+                okC = restock(lc, active[1].S.chop, "the Chopping station")
+            end
+            if okC then
+                local ok1, why1 = chopVeg(lc, active[1].S.chop, active[1].chopWants)
+                if ok1 then
+                    active[1].chopWants = {}
+                    local ok2, why2 = chopVeg(lc, other.S.chop, other.chopWants)
+                    if not ok2 then
+                        problem("Chopping", why2)
+                    end
+                else
+                    problem("Chopping", why1)
+                end
             end
         end
         for _, pl in ipairs(active) do
