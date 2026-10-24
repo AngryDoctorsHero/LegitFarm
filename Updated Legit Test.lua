@@ -17068,9 +17068,11 @@ NC.mech = (function()
     local KEEP = 10.5
     -- a wide agent first: the path keeps clear of the drawers, stools, racks and bikes (seen live: brushing past them made
     -- the character stop and start)
+    -- (radius 1.5 first: the player's way between station 1's drawer and the Classic rack is 3.8 studs wide, a radius 2
+    -- agent did not fit and was sent round the far side of the rack into it)
     local AGENTS = {
-        { AgentRadius = 2, AgentHeight = 5, AgentCanJump = false },
         { AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = false },
+        { AgentRadius = 2, AgentHeight = 5, AgentCanJump = false },
         { AgentRadius = 1, AgentHeight = 5, AgentCanJump = false },
     }
     local station
@@ -17184,19 +17186,30 @@ NC.mech = (function()
     end
 
     -- a free floor spot (nothing solid where the character would stand)
-    local function freeFloor(p)
+    -- the garage floor's height (the tire racks stand on it: live 0.41, the floor 0.50)
+    local floorRef
+    local function freeFloor(p, room)
+        if not floorRef then
+            local I = interior()
+            local r = I and I:FindFirstChild("TireRacks") and I.TireRacks:GetChildren()[1]
+            floorRef = r and r:GetPivot().Position.Y
+        end
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = ignoreList()
         local h = workspace:Raycast(Vector3.new(p.X, p.Y + 6, p.Z), Vector3.new(0, -14, 0), params)
-        if not h then
+        -- only the floor itself: a hit on top of a rack / table / stool is no spot to walk to (seen live: a corridor point
+        -- on top of the Classic rack, the walk aimed at it and stood still)
+        if not h or (floorRef and h.Position.Y > floorRef + 1.2) then
             return nil
         end
         local op = OverlapParams.new()
         op.FilterType = Enum.RaycastFilterType.Exclude
         op.FilterDescendantsInstances = params.FilterDescendantsInstances
         op.RespectCanCollide = true
-        if #workspace:GetPartBoundsInBox(CFrame.new(h.Position + Vector3.new(0, 2.6, 0)), Vector3.new(2.4, 4, 2.4), op) > 0 then
+        -- (room: the free width around the spot; walk points get 3.6 so nothing stands right next to them)
+        local wdt = room or 2.4
+        if #workspace:GetPartBoundsInBox(CFrame.new(h.Position + Vector3.new(0, 2.6, 0)), Vector3.new(wdt, 4, wdt), op) > 0 then
             return nil
         end
         return h.Position
@@ -17287,7 +17300,22 @@ NC.mech = (function()
 
     -- Walking: the path (PathfindingService) is only used when every point on it keeps KEEP studs from the other stations
     -- (a point already closer at the start may not get closer); otherwise it goes along the wall corridor
+    -- and never over the lift pad of a station it does not work at (seen live: walking over station 1's pad with a wheel
+    -- started station 1 and sent a customer there), whoever works it; a pad it already stands on may be walked off
+    local pads = {} -- every station's lift footprint { w, cf, size }, set each step
+    local function onPad(p, own, skip)
+        for _, pd in ipairs(pads) do
+            if pd.w ~= own and pd ~= skip then
+                local rel = pd.cf:PointToObjectSpace(p)
+                if math.abs(rel.X) < pd.size.X / 2 + 1.5 and math.abs(rel.Z) < pd.size.Z / 2 + 1.5 then
+                    return pd
+                end
+            end
+        end
+    end
+
     local function pathOK(wps, own, list, from)
+        local startPad = onPad(from, own)
         for i = 2, #wps do
             if wps[i].Action == Enum.PathWaypointAction.Jump then
                 return false
@@ -17296,6 +17324,9 @@ NC.mech = (function()
             local n = math.max(1, math.ceil(flatDist(a, b)))
             for k = 0, n do
                 local p = a:Lerp(b, k / n)
+                if onPad(p, own, startPad) then
+                    return false
+                end
                 for _, w in ipairs(list) do
                     if w ~= own then
                         local ct = w.CustomerTarget.Position
@@ -17309,7 +17340,40 @@ NC.mech = (function()
         return true
     end
 
+    -- straight when the way is clear (a character-sized box cast along it hits nothing solid): walked like a player walks.
+    -- Seen live: between station 1's drawer and the Classic rack the floor is open (x 288-291), yet every path agent was
+    -- routed round the far side of the rack and into it
+    local function straight(from, to, own, list)
+        local d = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+        if d.Magnitude < 0.5 then
+            return { from, to }
+        end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignoreList()
+        params.RespectCanCollide = true
+        local y = (floorRef or math.min(from.Y, to.Y)) + 2.6
+        local ok, hit = pcall(function()
+            return workspace:Blockcast(CFrame.new(from.X, y, from.Z), Vector3.new(2.2, 3.6, 2.2), d, params)
+        end)
+        if not ok or hit then
+            return nil
+        end
+        local wps = {
+            { Position = Vector3.new(from.X, from.Y, from.Z), Action = Enum.PathWaypointAction.Walk },
+            { Position = Vector3.new(to.X, to.Y, to.Z), Action = Enum.PathWaypointAction.Walk },
+        }
+        if not pathOK(wps, own, list, from) then
+            return nil
+        end
+        return { from, to }
+    end
+
     local function plan(from, to, own, list)
+        local s = straight(from, to, own, list)
+        if s then
+            return s
+        end
         for _, cfg in ipairs(AGENTS) do
             local p = PathfindingService:CreatePath(cfg)
             local ok = pcall(function()
@@ -17328,19 +17392,27 @@ NC.mech = (function()
         end
     end
 
-    local corridorZ
+    local corridorZ, wallSign = nil, 1
     -- the whole line from `from` to `to`: straight when it keeps away from the other stations, else via the corridor
     local function route(from, to, own, list)
-        local direct = plan(from, to, own, list)
-        if direct or not corridorZ then
-            return direct
+        -- to / from the paint table and the oil cans (by the wall) it always goes round by the wall, never across the middle
+        -- of the garage (the player's green path); the way back is the same way
+        -- (a spot on the wall side of the corridor line is the paint table / oil cans)
+        local wall = corridorZ ~= nil and ((to.Z - corridorZ) * wallSign > 2 or (from.Z - corridorZ) * wallSign > 2)
+        if not wall then
+            local direct = plan(from, to, own, list)
+            if direct or not corridorZ then
+                return direct
+            end
         end
         local line = { from }
-        -- a corridor point on free floor (seen live: a stool stands in the corridor at x 283-285)
+        -- a corridor point on free floor with room around it (seen live: a stool stands in the wall line at x 282-286 and
+        -- the Classic rack from x 290; walking to a point next to the rack ran the character into it). The line moves
+        -- toward the wall beside the drawers of stations 2 / 3, like the player's own (z -294 by the racks, -291.6 there)
         local function corridorAt(x, y)
             for _, dx in ipairs({ 0, -1.5, 1.5, -3, 3, -4.5, 4.5, -6, 6 }) do
-                for _, dz in ipairs({ 0, -1, 1 }) do
-                    local f = freeFloor(Vector3.new(x + dx, y, corridorZ + dz))
+                for _, dz in ipairs({ 0, 1, 2, -1 }) do
+                    local f = freeFloor(Vector3.new(x + dx, y, corridorZ + dz), 3.6)
                     if f then
                         return f
                     end
@@ -17365,6 +17437,21 @@ NC.mech = (function()
                 return x.s < y.s
             end)
             table.insert(out, 1, { p = p })
+            -- the station's own spot is left / reached on its open side, straight out from the lift (the player's green path
+            -- at station 1: out past the drawer's far end, never between the lift and the drawer)
+            local mine = own and standCache[own]
+            if mine and flatDist(p, mine) < 2 then
+                local lc = own.Lift:GetBoundingBox()
+                local outward = Vector3.new(p.X - lc.Position.X, 0, p.Z - lc.Position.Z)
+                if outward.Magnitude > 0.1 then
+                    -- (out from the lift and toward the wall, like the player: station 1 284,-305 -> 288.9,-301.8; straight
+                    -- out from the lift is where the customers queue and stand in the way)
+                    local f = freeFloor(p + outward.Unit * 5 + Vector3.new(0, 0, wallSign * 3.5), 3.6)
+                    if f and nearOther(f, own, list) >= KEEP and not onPad(f, own) then
+                        table.insert(out, 1, { p = f })
+                    end
+                end
+            end
             return out
         end
         local legs = {}
@@ -17479,10 +17566,6 @@ NC.mech = (function()
             local seg, stuck = 1, false
             local ref, refT = root.Position, os.clock()
             local lastAim, lastMoveT = nil, 0
-            local castT, cornerBlocked = 0, false
-            local castParams = RaycastParams.new()
-            castParams.FilterType = Enum.RaycastFilterType.Exclude
-            castParams.FilterDescendantsInstances = ignoreList()
             while alive() and not (abort and abort()) do
                 local p = root.Position
                 if flatDist(p, goal) <= within or (arrive and arrive(p)) then
@@ -17516,32 +17599,23 @@ NC.mech = (function()
                     cur = nxt
                     k += 1
                 end
-                -- no corner cutting next to objects: when the body's straight line to the point ahead would brush something
-                -- solid, it aims at the path's own waypoint instead (the path already keeps clear of it)
-                if k > seg and os.clock() - castT > 0.1 then
-                    castT = os.clock()
-                    local d = Vector3.new(aim.X - p.X, 0, aim.Z - p.Z)
-                    if d.Magnitude > 0.2 then
-                        local ok, hit = pcall(function()
-                            return workspace:Blockcast(CFrame.new(Vector3.new(p.X, p.Y - 0.8, p.Z)), Vector3.new(2.2, 2.6, 2.2), d, castParams)
-                        end)
-                        cornerBlocked = ok and hit ~= nil and hit.Instance.CanCollide
+                -- a point ahead right where the character already is (waypoints bunched up) is no aim: on to the next waypoint,
+                -- only ever forward along the line (seen live: aiming at its own spot it stood still; picking points either way
+                -- made it twitch back and forth at a corner)
+                if flatDist(p, aim) < 1.5 and flatDist(p, goal) > within then
+                    if seg < #line - 1 then
+                        seg += 1
+                        aim = line[seg + 1]
                     else
-                        cornerBlocked = false
+                        aim = goal -- (the path ends a little short of the goal: straight on to it)
                     end
                 end
-                if k > seg and cornerBlocked then
-                    -- (the next waypoint at least 2 studs on: one right in front of the character was "reached" at once)
-                    for j = seg + 1, #line do
-                        if flatDist(p, line[j]) >= 2 or j == #line then
-                            aim = line[j]
-                            break
-                        end
-                    end
-                end
-                -- the game's take / bike actions end the current MoveTo (seen live: MoveDirection 0 with the walk target
-                -- still set, a 0.8 s stand after every wheel): it is given again the moment the character stops moving
-                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.25 or hum.MoveDirection.Magnitude < 0.1 then
+                -- the game's take / bike actions end the current MoveTo (seen live: a 0.8 s stand after every wheel): it is given
+                -- again the moment the character is not moving (its speed; MoveDirection reads 0 under MoveTo here, so going by it
+                -- gave a new MoveTo every frame and the character twitched)
+                local spd = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
+                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5
+                    or (spd < 2 and os.clock() - lastMoveT > 0.15) then
                     hum:MoveTo(aim)
                     lastAim, lastMoveT = aim, os.clock()
                 end
@@ -17892,7 +17966,8 @@ NC.mech = (function()
                 f, d = tableStand(p, list)
             end
             if f then
-                corridorZ = f.Z + d.Z * 3.2 -- (watched live: the player walks the wall line at z -293 .. -291.6)
+                corridorZ = f.Z + d.Z * 4.3 -- (watched live: the player walks the wall line at z -294 .. -291.6)
+                wallSign = -d.Z
             end
         end
         -- station 1 unless another player works it; back to station 1 when it is free and this one has no customer
@@ -17922,6 +17997,13 @@ NC.mech = (function()
         local stand = standOf(w, list)
         -- the stations walking keeps away from: the free ones only (a station another player works gets no customer
         -- from this character; seen live with a player at station 1: keeping away from it made 8 s detours to the racks)
+        if #pads ~= #list then
+            table.clear(pads)
+            for _, s in ipairs(list) do
+                local cf, size = s.Lift:GetBoundingBox()
+                table.insert(pads, { w = s, cf = cf, size = size })
+            end
+        end
         local guarded = {}
         for _, s in ipairs(list) do
             if s == w or not takenByOther(s) then
@@ -17983,6 +18065,39 @@ NC.mech = (function()
             order.paint = order.color and paintFor(I, order.color)
             orders[npc] = order
             setStatus("Request: " .. describe(order))
+            -- this order's ways (bike -> item -> bike) are planned now, one after another, while the request is read (seen
+            -- live: a way to the wall still being planned when the walk started = a 0.9 s stand at the bike)
+            do
+                local items = {}
+                for _, wt in ipairs(order.wheels) do
+                    local rack = I.TireRacks:FindFirstChild(wt)
+                    table.insert(items, rack and rackStand(rack))
+                end
+                if order.oil then
+                    local can, cd
+                    for _, c in ipairs(I.OilCans:GetChildren()) do
+                        local d = flatDist(c:GetPivot().Position, root.Position)
+                        if not cd or d < cd then
+                            can, cd = c, d
+                        end
+                    end
+                    table.insert(items, can and tableStand(can, list))
+                end
+                if order.paint then
+                    table.insert(items, (tableStand(order.paint, list)))
+                end
+                local glist = list
+                task.spawn(function()
+                    for _, s in ipairs(items) do
+                        for _, pair in ipairs({ { stand, s }, { s, stand } }) do
+                            local h = preplan(pair[1], pair[2], w, glist)
+                            while running and not h.done do
+                                task.wait(0.03)
+                            end
+                        end
+                    end
+                end)
+            end
             pause(0.6, 1) -- reading the request
         end
         if order.dead then
@@ -18039,7 +18154,7 @@ NC.mech = (function()
         table.clear(standCache)
         table.clear(warmed)
         table.clear(routeCache)
-        corridorZ, spent = nil, nil
+        corridorZ, spent, wallSign = nil, nil, 1
     end
 
     return M
