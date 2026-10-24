@@ -39,6 +39,7 @@ local JOB_IDS = {
     ["Fast Food Worker - Burger Cook"] = CASH_ID, [PIZZA_NAME] = PIZZA_ID, [TEACHER_NAME] = TEACHER_ID,
     ["BFF Supermarket"] = "SupermarketCashier", ["Hairdresser - Stylez Hair Studio"] = "StylezHairdresser",
     ["Fisherman - Fishing Hut"] = "HutFisherman", ["Mechanic - Mike's Motors"] = "MikesMechanic",
+    ["Stocker - BFF Supermarket"] = "SupermarketStocker",
 }
 local CHOP_RANGE = 6
 local MAX_SWINGS = 25
@@ -549,7 +550,58 @@ local function getJanitorSpawns()
     return school and school:FindFirstChild("JanitorSpawns")
 end
 
-local function findTrash(rootPos)
+-- Order: one area at a time - every mess on the first floor (the floor the job teleport puts the character on), then
+-- the second floor, then outside - and an area is only left once the messes it had when the character started on it are
+-- all cleaned; messes that appear there meanwhile wait for the next round (seen live: new first floor messes appeared
+-- about as fast as they were cleaned, 15 cleaned in 3 minutes with 2-6 always waiting, and the second floor was never
+-- reached while its messes went from 10 to 14). Found live:
+-- SchoolArea.School.JanitorSpawns holds 55 spawns (GroundSpawn x31, WallSpawn x24); the floor a spawn belongs to is the
+-- floor under it (30 at the teleport's level y 24, 25 on the floor above at y 44); outside = no roof above it (none of
+-- the 55 had open sky above, live). Within an area: the nearest mess first, as before.
+local findTrash
+do
+local spawnArea = setmetatable({}, { __mode = "k" }) -- spawn -> 1 first floor, 2 second floor, 3 outside
+local phase, round = 0, setmetatable({}, { __mode = "k" }) -- the area being cleaned, and its messes when it was started
+
+local function areaOf(spawn)
+    local a = spawnArea[spawn]
+    if a then
+        return a
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = { spawn.Parent }
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then
+            table.insert(ignore, plr.Character)
+        end
+    end
+    params.FilterDescendantsInstances = ignore
+    local p = spawn.Position
+    local wall = spawn.Name == "WallSpawn"
+    if not workspace:Raycast(wall and p or p + Vector3.new(0, 3, 0), Vector3.new(0, 80, 0), params) then
+        a = 3
+    else
+        -- the floor under it (a wall spawn: the floor in front of the wall it is on)
+        local floorY
+        local n = Vector3.new(spawn.CFrame.UpVector.X, 0, spawn.CFrame.UpVector.Z)
+        for _, off in ipairs(wall and n.Magnitude > 0.3 and { n.Unit * 3, -n.Unit * 3 } or { Vector3.zero }) do
+            local h = workspace:Raycast(p + off + Vector3.new(0, 1, 0), Vector3.new(0, -30, 0), params)
+            if h then
+                floorY = h.Position.Y
+                break
+            end
+        end
+        local school = spawn.Parent.Parent
+        local tp = school and school:FindFirstChild("WorkTeleport_SchoolJanitor")
+        local baseY = tp and tp.Position.Y or 24
+        a = (floorY or p.Y) < baseY + 8 and 1 or 2
+    end
+    spawnArea[spawn] = a
+    return a
+end
+
+function findTrash(rootPos)
     local spawns = getJanitorSpawns()
     if not spawns then
         return nil
@@ -560,7 +612,7 @@ local function findTrash(rootPos)
             badTrash[o] = nil
         end
     end
-    local best, bestSpawn, bestScore
+    local found = { {}, {}, {} } -- per area: { { obj, spawn, score } }
     for _, spawn in ipairs(spawns:GetChildren()) do
         local obj = spawn:FindFirstChild("Object")
         if obj and obj.Parent == spawn and not (badTrash[obj] and badTrash[obj] > now)
@@ -568,12 +620,39 @@ local function findTrash(rootPos)
             local pos = obj:GetPivot().Position
             local score = (Vector3.new(pos.X, 0, pos.Z) - Vector3.new(rootPos.X, 0, rootPos.Z)).Magnitude
                 + math.abs(pos.Y - rootPos.Y) * 2
-            if not bestScore or score < bestScore then
-                best, bestSpawn, bestScore = obj, spawn, score
-            end
+            table.insert(found[areaOf(spawn)], { obj, spawn, score })
         end
     end
-    return best, bestSpawn
+    local function nearestOf(list, onlyRound)
+        local b
+        for _, e in ipairs(list) do
+            if (not onlyRound or round[e[1]]) and (not b or e[3] < b[3]) then
+                b = e
+            end
+        end
+        return b
+    end
+    -- the messes of the area being cleaned that it had when it was started, the nearest first
+    local b = phase > 0 and nearestOf(found[phase], true)
+    if b then
+        return b[1], b[2]
+    end
+    -- those are done: the next area in the order (first floor, second floor, outside) that has a mess, starting from
+    -- the one after this (the first time: the first floor)
+    for k = 1, 3 do
+        local a = phase == 0 and k or (phase - 1 + k) % 3 + 1
+        if #found[a] > 0 then
+            phase = a
+            table.clear(round)
+            for _, e in ipairs(found[a]) do
+                round[e[1]] = true
+            end
+            b = nearestOf(found[a], false)
+            return b[1], b[2]
+        end
+    end
+    return nil
+end
 end
 
 local function floorBelow(x, y, z, ignore)
@@ -17971,7 +18050,27 @@ NC.mech = (function()
             end
         end
         -- station 1 unless another player works it; back to station 1 when it is free and this one has no customer
-        local mine = station and station.Parent and station.Occupied.Value and not takenByOther(station)
+        -- the station it works is only given up when the game marks another player on it (InUse): another player just
+        -- walking past (seen live with two accounts: the other one passing station 1 on its way to the racks, 2.2 studs from
+        -- its customer spot) sent this one off to station 3
+        local function usedByOther(s)
+            local u = s:FindFirstChild("InUse") and s.InUse.Value
+            return typeof(u) == "Instance" and u ~= LocalPlayer and u.Parent == Players
+        end
+        local mine = station and station.Parent and not usedByOther(station)
+        if mine and not station.Occupied.Value then
+            -- no customer here: a station before it in the order (or the test station) that is free is used instead
+            local forced = list[tonumber(getgenv().LFJ_MechStation) or 0]
+            for _, s in ipairs(forced and { forced } or list) do
+                if s == station then
+                    break
+                end
+                if not takenByOther(s) and standOf(s, list) then
+                    mine = false
+                    break
+                end
+            end
+        end
         if not mine then
             local pick
             -- (getgenv().LFJ_MechStation = 2 / 3 / 4: that station is tried first, used to test the other stations)
@@ -18158,6 +18257,659 @@ NC.mech = (function()
     end
 
     return M
+end)()
+
+-- Stocker - BFF Supermarket (job id SupermarketStocker). Found live in the game's own JobHandler.SupermarketStocker: the
+-- stock room is the job's AreaBlock (JobArea_SupermarketStocker); the food crates are Environment.Locations.City.
+-- Supermarket.Geometry.Crates "Crate" x24 ("BagCrate" there is the cashier's), whose "I_Take" (TakeFoodCrate) is offered
+-- inside the stock room with empty hands; the shelves are Supermarket.Interior.Shelves (28: Fridge_*, Shelf_*, Aisle_*,
+-- WallAisle_*), each with a BoolValue IsEmpty, whose "I_Restock" (RestockShelf) is offered outside the stock room while
+-- holding "Food Crate" and IsEmpty is true. Seen live: 5 shelves are empty at a time; restocking one makes another one
+-- empty (nothing changes on its own: watched 50 s). The shift ends when the character leaves Supermarket.Exterior.Floor.
+-- Measured live: a crate is taken from 5.4 studs, a shelf restocked from 5.0 studs (flat, to its middle).
+NC.stock = (function()
+    local K = {}
+    local JOB = "SupermarketStocker"
+    local AGENTS = {
+        { AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = false },
+        { AgentRadius = 1, AgentHeight = 5, AgentCanJump = false },
+    }
+    local target -- the shelf being stocked now (one at a time)
+    local routeCache = {}
+    local nextPre -- { goal, h }: the way on, planned during the take / restock, used by the next walk
+    local function preFor(goal, from, preplanFn)
+        if nextPre and (Vector3.new(nextPre.goal.X, 0, nextPre.goal.Z) - Vector3.new(goal.X, 0, goal.Z)).Magnitude < 1 then
+            local h = nextPre.h
+            nextPre = nil
+            return h
+        end
+        return preplanFn(from, goal)
+    end
+    local outerSetStatus = setStatus
+    local function setStatus(text)
+        if farming then
+            outerSetStatus(text)
+        end
+    end
+
+    local function alive()
+        return running and farming and isWorkingJob(JOB)
+    end
+
+    local function pause(a, b)
+        local t = a + math.random() * (b - a)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < t do
+            task.wait(0.03)
+        end
+    end
+
+    local function waitUntil(cond, timeout)
+        local t0 = os.clock()
+        while alive() and os.clock() - t0 < timeout do
+            if cond() then
+                return true
+            end
+            task.wait(0.05)
+        end
+        return cond()
+    end
+
+    local function flatDist(a, b)
+        return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+    end
+
+    local function market()
+        local n = workspace:FindFirstChild("Environment")
+        for _, name in ipairs({ "Locations", "City", "Supermarket" }) do
+            n = n and n:FindFirstChild(name)
+        end
+        return n
+    end
+
+    -- the stock room: the same box test the game's own isInWarehouse does with the job's AreaBlock
+    local function inStockRoom(p)
+        local ok, inside = pcall(function()
+            local ab = JobHandler:GetCurJobModule().AreaBlock
+            local v = ab.CFrame:Inverse() * p
+            return math.abs(v.X) < ab.Size.X * 0.5 and math.abs(v.Z) < ab.Size.Z * 0.5
+        end)
+        return ok and inside
+    end
+
+    -- on the shop's floor (Exterior.Floor: leaving it ends the shift), `inset` studs in from its edge
+    local function onShopFloor(p, inset)
+        local sm = market()
+        local f = sm and sm:FindFirstChild("Exterior") and sm.Exterior:FindFirstChild("Floor")
+        if not f then
+            return true
+        end
+        return math.abs(p.X - f.Position.X) < f.Size.X * 0.5 - inset and math.abs(p.Z - f.Position.Z) < f.Size.Z * 0.5 - inset
+    end
+
+    local function callback(obj, wanted)
+        local reg = getInteractRegistry()
+        local entry = reg and obj and reg[obj]
+        local gens = entry and entry[1]
+        for _, gen in ipairs(type(gens) == "table" and gens or {}) do
+            if type(gen) == "function" then
+                local ok, text, _, cb = pcall(gen)
+                if ok and text == wanted and type(cb) == "function" then
+                    return cb
+                end
+            end
+        end
+    end
+
+    local function use(cb)
+        if not cleanSafe(cb) then
+            farming = false
+            if FarmToggle then
+                withUiIdentity(function()
+                    FarmToggle:Set(false)
+                end)
+            end
+            outerSetStatus("Stopped: unsafe stocker state")
+            return false
+        end
+        task.spawn(function()
+            pcall(cb)
+        end)
+        return true
+    end
+
+    local function holding()
+        local ok, e = pcall(function()
+            return JobHandler.Shared.EquipmentService:GetEquipped(LocalPlayer)
+        end)
+        return ok and tostring(e) == "Food Crate"
+    end
+
+    local function handsFree()
+        local ok, e = pcall(function()
+            return JobHandler.Shared.EquipmentService:GetEquipped(LocalPlayer)
+        end)
+        return ok and e == nil
+    end
+
+    local function ignoreList()
+        local ignore = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        return ignore
+    end
+
+    -- a free floor spot near p (the floor itself - live 19.7 on the shop floor, 20.1 in the stock room - nothing solid where
+    -- the character would stand)
+    local function freeFloor(p)
+        local sm = market()
+        local fl = sm and sm:FindFirstChild("Exterior") and sm.Exterior:FindFirstChild("Floor")
+        local floorY = fl and fl.Position.Y + fl.Size.Y / 2 or p.Y
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignoreList()
+        local h = workspace:Raycast(Vector3.new(p.X, floorY + 6, p.Z), Vector3.new(0, -14, 0), params)
+        if not h or math.abs(h.Position.Y - floorY) > 1.5 then
+            return nil
+        end
+        local op = OverlapParams.new()
+        op.FilterType = Enum.RaycastFilterType.Exclude
+        op.FilterDescendantsInstances = params.FilterDescendantsInstances
+        op.RespectCanCollide = true
+        if #workspace:GetPartBoundsInBox(CFrame.new(h.Position + Vector3.new(0, 2.6, 0)), Vector3.new(2.4, 4, 2.4), op) > 0 then
+            return nil
+        end
+        return h.Position
+    end
+
+    local function crates()
+        local sm = market()
+        local folder = sm and sm:FindFirstChild("Geometry") and sm.Geometry:FindFirstChild("Crates")
+        local out = {}
+        for _, c in ipairs(folder and folder:GetChildren() or {}) do
+            if c.Name == "Crate" then
+                table.insert(out, c)
+            end
+        end
+        return out
+    end
+
+    local function emptyShelves()
+        local sm = market()
+        local folder = sm and sm:FindFirstChild("Interior") and sm.Interior:FindFirstChild("Shelves")
+        local out = {}
+        for _, s in ipairs(folder and folder:GetChildren() or {}) do
+            local e = s:FindFirstChild("IsEmpty")
+            if e and e.Value then
+                table.insert(out, s)
+            end
+        end
+        return out
+    end
+
+    -- where to stand for a crate: on the stock room floor beside it, the side nearest to `from`
+    local function crateStand(crate, from)
+        local p = crate:GetPivot().Position
+        local best, bd
+        for k = 0, 7 do
+            local a = k * math.pi / 4
+            local f = freeFloor(p + Vector3.new(math.cos(a) * 4, 0, math.sin(a) * 4))
+            if f and inStockRoom(f) then
+                local d = flatDist(f, from)
+                if not bd or d < bd then
+                    best, bd = f, d
+                end
+            end
+        end
+        return best
+    end
+
+    -- spots / shelves a walk could not reach (seen live: the side spot between two fridges by the back wall has free
+    -- floor but no path in; the fridge's front does): left out for a while, the next side / shelf is used
+    local badStand, badShelf = {}, setmetatable({}, { __mode = "k" })
+    local function standKey(p)
+        return math.floor(p.X + 0.5) .. "," .. math.floor(p.Z + 0.5)
+    end
+
+    -- where to stand for a shelf: in front of one of its sides, on the shop floor and outside the stock room, the one
+    -- nearest to `from` (a wall behind a wall aisle is no spot: off the shop floor)
+    -- (measured from the shelf's own surface, a ray toward it from 8 directions: the island aisles are 17 studs across and
+    -- turned, their box put the spot 14 studs from the middle where Restock did nothing; 2.2 studs from the edge = 8.9 from
+    -- the middle worked live). Returns the spot and the surface point it faces.
+    local function shelfStand(shelf, from)
+        local cf = shelf:GetBoundingBox()
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Include
+        rp.FilterDescendantsInstances = { shelf }
+        local best, bestHit, bd
+        for k = 0, 7 do
+            local a = k * math.pi / 4
+            local d = Vector3.new(math.cos(a), 0, math.sin(a))
+            local h = workspace:Raycast(cf.Position + d * 20, -d * 20, rp)
+            if h then
+                for _, gap in ipairs({ 2.2, 3 }) do
+                    local f = freeFloor(h.Position + d * gap)
+                    if f and onShopFloor(f, 2) and not inStockRoom(f) and not (badStand[standKey(f)] and badStand[standKey(f)] > os.clock()) then
+                        local dist = flatDist(f, from)
+                        if not bd or dist < bd then
+                            best, bestHit, bd = f, h.Position, dist
+                        end
+                        break
+                    end
+                end
+            end
+        end
+        return best, bestHit
+    end
+
+    -- Walking: PathfindingService waypoints followed with Humanoid:MoveTo toward a point 3 studs ahead, only ever forward
+    -- along the line; MoveTo given again only when the character has stopped (its speed)
+    local function plan(from, to)
+        for _, cfg in ipairs(AGENTS) do
+            local p = PathfindingService:CreatePath(cfg)
+            local ok = pcall(function()
+                p:ComputeAsync(from, to)
+            end)
+            if ok and p.Status == Enum.PathStatus.Success then
+                local wps = p:GetWaypoints()
+                if #wps > 0 and flatDist(wps[#wps].Position, to) < 3 then
+                    local pts, good = {}, true
+                    for _, wp in ipairs(wps) do
+                        pts[#pts + 1] = wp.Position
+                        if not onShopFloor(wp.Position, 0.5) then
+                            good = false -- (off the shop floor the shift ends)
+                        end
+                    end
+                    if good then
+                        return pts
+                    end
+                end
+            end
+        end
+    end
+
+    -- planned before it is needed (the way on while the current walk / take / restock happens), kept per pair of spots
+    local function preplan(from, to)
+        local key = string.format("%d,%d>%d,%d", math.floor(from.X + 0.5), math.floor(from.Z + 0.5), math.floor(to.X + 0.5), math.floor(to.Z + 0.5))
+        local h = routeCache[key]
+        if h and (not h.done or h.line) then
+            return h
+        end
+        h = { done = false }
+        routeCache[key] = h
+        task.spawn(function()
+            local ok, line = pcall(plan, from, to)
+            h.line = ok and line or nil
+            h.done = true
+        end)
+        return h
+    end
+
+    local function walk(goal, within, pre, arrive)
+        for attempt = 1, 4 do
+            if not alive() then
+                return false
+            end
+            local _, hum, root = getChar()
+            if not (hum and root) then
+                return false
+            end
+            if flatDist(root.Position, goal) <= within or (arrive and arrive(root.Position)) then
+                return true
+            end
+            local line
+            if pre and attempt == 1 then
+                local t0 = os.clock()
+                while not pre.done and os.clock() - t0 < 3 do
+                    RunService.Heartbeat:Wait()
+                end
+                line = pre.line
+                if line and flatDist(line[1], root.Position) > 6 then
+                    line = nil
+                end
+            end
+            line = line or plan(root.Position, goal)
+            if not line then
+                task.wait(0.3)
+                continue
+            end
+            local seg, stuck = 1, false
+            local ref, refT = root.Position, os.clock()
+            local lastAim, lastMoveT = nil, 0
+            while alive() do
+                local p = root.Position
+                if flatDist(p, goal) <= within or (arrive and arrive(p)) then
+                    return true
+                end
+                while seg < #line - 1 do
+                    local a, b = line[seg], line[seg + 1]
+                    local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                    local l2 = ab:Dot(ab)
+                    local t = l2 > 1e-6 and Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2 or 1
+                    if t >= 1 or flatDist(p, b) <= 1.5 then
+                        seg += 1
+                    else
+                        break
+                    end
+                end
+                local a, b = line[seg], line[seg + 1] or line[seg]
+                local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                local l2 = ab:Dot(ab)
+                local t = l2 > 1e-6 and math.clamp(Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2, 0, 1) or 1
+                local cur, left, aim = a:Lerp(b, t), 3, line[#line]
+                local k = seg
+                while k < #line do
+                    local nxt = line[k + 1]
+                    local d = flatDist(cur, nxt)
+                    if d >= left then
+                        aim = cur:Lerp(nxt, d > 1e-6 and left / d or 1)
+                        break
+                    end
+                    left -= d
+                    cur = nxt
+                    k += 1
+                end
+                if flatDist(p, aim) < 1.5 and flatDist(p, goal) > within then
+                    if seg < #line - 1 then
+                        seg += 1
+                        aim = line[seg + 1]
+                    else
+                        aim = goal
+                    end
+                end
+                local spd = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
+                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5
+                    or (spd < 2 and os.clock() - lastMoveT > 0.15) then
+                    hum:MoveTo(aim)
+                    lastAim, lastMoveT = aim, os.clock()
+                end
+                if os.clock() - refT > 0.9 then
+                    if flatDist(p, ref) < 0.5 then
+                        stuck = true
+                        break
+                    end
+                    ref, refT = p, os.clock()
+                end
+                RunService.Heartbeat:Wait()
+            end
+            if not stuck then
+                return false
+            end
+            table.clear(routeCache)
+        end
+        return false
+    end
+
+    local function stopWalk()
+        local _, hum, root = getChar()
+        if hum and root then
+            hum:MoveTo(root.Position)
+        end
+    end
+
+    local function nearestShelf(list, from)
+        local best, bs, bh, bd
+        for _, s in ipairs(list) do
+            if not (badShelf[s] and badShelf[s] > os.clock()) then
+                local st, hit = shelfStand(s, from)
+                if st then
+                    local d = flatDist(st, from)
+                    if not bd or d < bd then
+                        best, bs, bh, bd = s, st, hit, d
+                    end
+                end
+            end
+        end
+        return best, bs, bh
+    end
+
+    -- the stock room's doorway: where the path from the last restock spot (open shop floor) to the spot the first box
+    -- was taken from (open floor in the room) enters the room - live 543.0,-779.8 / 542.8,-782.1, the west wall is open
+    -- from z -786 to -781 (paths from the room's / the shop's middle had no start: a crate pile / a shelf stands there).
+    -- The crates all have the same name ("Crate") and no attributes; the piles by the doorway are told apart only by where
+    -- they stand: left z -772..-777 and right z -792..-795 at x 541-548, the others at x 561-565 and 577-583 (the back)
+    local doorway, roomSpot, shopSpot
+    local function doorwayPoint()
+        if doorway or not (roomSpot and shopSpot) then
+            return doorway
+        end
+        local p = PathfindingService:CreatePath({ AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = false })
+        local okP = pcall(function()
+            p:ComputeAsync(shopSpot, roomSpot)
+        end)
+        if okP and p.Status == Enum.PathStatus.Success then
+            for _, wp in ipairs(p:GetWaypoints()) do
+                if inStockRoom(wp.Position) then
+                    doorway = wp.Position
+                    break
+                end
+            end
+        end
+        return doorway
+    end
+
+    local tookOne = false -- the first box after Auto Farm is turned on is the one nearest the character
+    local function nearestCrate(from)
+        -- after the first box: only the piles by the doorway (within 16 studs of it; the nearest other crate is 19 away),
+        -- the crate nearest the doorway (seen live: coming back from a shelf it walked to the back of the stock room)
+        local door = tookOne and doorwayPoint()
+        if door then
+            local best, bs, bd
+            for _, c in ipairs(crates()) do
+                local d = flatDist(c:GetPivot().Position, door)
+                if d <= 16 and (not bd or d < bd) then
+                    local st = crateStand(c, door)
+                    if st then
+                        best, bs, bd = c, st, d
+                    end
+                end
+            end
+            if best then
+                return best, bs
+            end
+        end
+        local best, bs, bd
+        for _, c in ipairs(crates()) do
+            local d = flatDist(c:GetPivot().Position, from)
+            if not bd or d < bd then
+                local st = crateStand(c, from)
+                if st then
+                    best, bs, bd = c, st, d
+                end
+            end
+        end
+        return best, bs
+    end
+
+    local function isEmpty(s)
+        local e = s and s.Parent and s:FindFirstChild("IsEmpty")
+        return e ~= nil and e.Value
+    end
+
+    function K.step()
+        if not farming then
+            task.wait(0.3)
+            return
+        end
+        if not isWorkingJob(JOB) then
+            setStatus("Start the Stocker - BFF Supermarket job first")
+            task.wait(1)
+            return
+        end
+        local _, hum, root = getChar()
+        if not hum then
+            setStatus("Waiting for character")
+            task.wait(1)
+            return
+        end
+        if not market() then
+            setStatus("Waiting for the supermarket")
+            task.wait(1)
+            return
+        end
+        if holding() then
+            -- a box in hand: to the shelf being stocked (another empty one when that one was stocked meanwhile)
+            if not isEmpty(target) then
+                target = nil
+            end
+            local stand, surface
+            if target then
+                -- (the spot whose way was planned while taking the box)
+                if nextPre and nextPre.shelf == target then
+                    stand, surface = nextPre.goal, nextPre.surface
+                else
+                    stand, surface = shelfStand(target, root.Position)
+                end
+            else
+                target, stand, surface = nearestShelf(emptyShelves(), root.Position)
+            end
+            if not (target and stand and surface) then
+                setStatus("No shelf needs stock, waiting")
+                task.wait(0.5)
+                return
+            end
+            local shelf = target
+            setStatus("Bringing the box to " .. shelf.Name)
+            -- (restocked as soon as the shelf's surface is within reach, still walking up to it)
+            if not walk(stand, 1.5, preFor(stand, root.Position, preplan), function(p)
+                return flatDist(p, surface) <= 3 and not inStockRoom(p)
+            end) then
+                if farming and not isEmpty(shelf) then
+                    target = nil -- (stocked by someone else on the way)
+                elseif farming then
+                    -- that spot is left out; the shelf's next side is tried, and with no side left the shelf for a while
+                    badStand[standKey(stand)] = os.clock() + 60
+                    nextPre = nil
+                    local _, _, r2 = getChar()
+                    if not (r2 and shelfStand(shelf, r2.Position)) then
+                        badShelf[shelf] = os.clock() + 30
+                        target = nil
+                    end
+                    setStatus("Can't reach " .. shelf.Name .. " from there, trying another way")
+                end
+                return
+            end
+            if not isEmpty(shelf) then
+                target = nil
+                return
+            end
+            local cb
+            waitUntil(function()
+                cb = callback(shelf, "I_Restock")
+                return cb ~= nil
+            end, 2)
+            if not cb then
+                setStatus("Restock is not offered at " .. shelf.Name .. ", retrying")
+                task.wait(0.5)
+                return
+            end
+            -- the next crate's way is planned while restocking (no stop to plan after it)
+            shopSpot = shopSpot or stand
+            local _, cs = nearestCrate(root.Position)
+            if cs then
+                nextPre = { goal = cs, h = preplan(root.Position, cs) }
+                -- and the box after it to its shelf (seen live: a long way to a far fridge still being planned when the
+                -- box was taken = a 2 s stand in the stock room)
+                local others = {}
+                for _, s in ipairs(emptyShelves()) do
+                    if s ~= shelf then
+                        table.insert(others, s)
+                    end
+                end
+                local _, s2 = nearestShelf(others, cs)
+                if s2 then
+                    preplan(cs, s2)
+                end
+            end
+            setStatus("Restocking " .. shelf.Name)
+            stopWalk()
+            pause(0.2, 0.35)
+            if not use(cb) then
+                return
+            end
+            waitUntil(function()
+                return not isEmpty(shelf) or not holding()
+            end, 3)
+            if isEmpty(shelf) and holding() then
+                -- not taken (too far from it): that spot is left out, another side of the shelf next
+                badStand[standKey(stand)] = os.clock() + 60
+                nextPre = nil
+                setStatus("Restock did not take at " .. shelf.Name .. ", another side")
+                return
+            end
+            target = nil
+            return
+        end
+        -- empty hands: a box from the stock room, then on to the empty shelf nearest to it
+        local list = emptyShelves()
+        if #list == 0 then
+            setStatus("No shelf needs stock, waiting")
+            task.wait(0.5)
+            return
+        end
+        if not handsFree() then
+            setStatus("Put away what you are holding first")
+            task.wait(1)
+            return
+        end
+        local crate, cstand = nearestCrate(root.Position)
+        if not (crate and cstand) then
+            setStatus("No box found in the stock room, waiting")
+            task.wait(1)
+            return
+        end
+        local cpos = crate:GetPivot().Position
+        -- the shelf for this box is chosen now and its way planned while walking to the box
+        local shelf, sstand, ssurface = nearestShelf(list, cstand)
+        local shelfPre = sstand and preplan(cstand, sstand)
+        setStatus("Walking to the stock")
+        if not walk(cstand, 1.5, preFor(cstand, root.Position, preplan), function(p)
+            return flatDist(p, cpos) <= 4.5 and inStockRoom(p)
+        end) then
+            if farming then
+                setStatus("Can't reach the stock, retrying")
+                task.wait(0.5)
+            end
+            return
+        end
+        local cb
+        waitUntil(function()
+            cb = crate.Parent and callback(crate, "I_Take")
+            return cb ~= nil
+        end, 1.5)
+        if not cb then
+            return -- (taken by someone else / just taken: the next one)
+        end
+        setStatus("Taking a box")
+        stopWalk()
+        pause(0.2, 0.35)
+        if not use(cb) then
+            return
+        end
+        target = shelf
+        tookOne = true
+        roomSpot = roomSpot or cstand
+        if shelfPre then
+            nextPre = { goal = sstand, h = shelfPre, shelf = shelf, surface = ssurface }
+        end
+        if not waitUntil(holding, 2) then
+            -- (seen live right after a shift starts: the game ignores the first takes for a few seconds)
+            setStatus("The box was not handed over, trying again")
+            task.wait(1)
+        end
+    end
+
+    function K.stop()
+        target = nil
+        nextPre = nil
+        tookOne, doorway, roomSpot, shopSpot = false, nil, nil, nil
+        table.clear(routeCache)
+    end
+
+    return K
 end)()
 
 local hookConns = {}
@@ -18369,7 +19121,8 @@ local function farmLoop()
             or selectedJob == TEACHER_NAME and NC.teacher.step or selectedJob == "BFF Supermarket" and NC.market.step
             or selectedJob == "Hairdresser - Stylez Hair Studio" and NC.hair.step
             or selectedJob == "Fisherman - Fishing Hut" and NC.fish.step
-            or selectedJob == "Mechanic - Mike's Motors" and NC.mech.step or farmStep)
+            or selectedJob == "Mechanic - Mike's Motors" and NC.mech.step
+            or selectedJob == "Stocker - BFF Supermarket" and NC.stock.step or farmStep)
         if not ok then
             warn("[Legit Farm Job] " .. tostring(err))
             setStatus("Error, retrying")
@@ -18383,7 +19136,7 @@ end
 -- UI
 JobsTab:CreateDropdown({
     Name = "Select Job",
-    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio", "Fisherman - Fishing Hut", "Mechanic - Mike's Motors" },
+    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio", "Fisherman - Fishing Hut", "Mechanic - Mike's Motors", "Stocker - BFF Supermarket" },
     CurrentOption = {},
     MultipleOptions = false,
     Flag = "LFJ_Job",
@@ -18460,6 +19213,7 @@ FarmToggle = JobsTab:CreateToggle({
             pcall(NC.hair.stop)
             pcall(NC.fish.stop)
             pcall(NC.mech.stop)
+            pcall(NC.stock.stop)
             if selectedJob ~= "Fast Food Worker - Burger Cook" then
                 stopWalking()
             end
@@ -18813,6 +19567,7 @@ getgenv().LegitFarmJob = function()
     pcall(NC.hair.stop)
     pcall(NC.fish.stop)
     pcall(NC.mech.stop)
+    pcall(NC.stock.stop)
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
@@ -18852,5 +19607,4 @@ getgenv().LegitFarmJob = function()
     end)
     getgenv().LegitFarmJob = nil
 end
-
 farmThread = task.spawn(farmLoop)
