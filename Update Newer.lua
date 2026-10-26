@@ -311,13 +311,31 @@ end
 
 local walkAgents
 local walkPathOK
-local function computePath(from, to, noJump)
+local function computePath(from, to, noJump, timeout)
     for _, cfg in ipairs(walkAgents or AGENT_TRIES) do
         if not (noJump and cfg.AgentCanJump) then
             local path = PathfindingService:CreatePath(cfg)
-            local ok = pcall(function()
-                path:ComputeAsync(from, to)
-            end)
+            local ok
+            if timeout then
+                -- (Janitor: a path request that hangs counts as no path after `timeout` s - seen live on mobile: the
+                -- character stood ~2 min on "Walking to trash")
+                local done = false
+                task.spawn(function()
+                    ok = pcall(function()
+                        path:ComputeAsync(from, to)
+                    end)
+                    done = true
+                end)
+                local t0 = os.clock()
+                while not done and os.clock() - t0 < timeout do
+                    task.wait(0.05)
+                end
+                ok = done and ok
+            else
+                ok = pcall(function()
+                    path:ComputeAsync(from, to)
+                end)
+            end
             if ok and path.Status == Enum.PathStatus.Success and (not walkPathOK or walkPathOK(path)) then
                 return path
             end
@@ -338,7 +356,15 @@ local function walkTo(target, strict)
         if (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(target.X, 0, target.Z)).Magnitude < 2.5 then
             return true
         end
-        local path = computePath(root.Position, target, strict)
+        -- strict == "jump" (Janitor): the path's end is checked like strict, but jumps are allowed (over / onto a chair,
+        -- couch or ledge; seen live: from the lobby's outside walkway every way needed a jump, every mess was marked
+        -- unreachable and it stood there on "No trash found")
+        if strict == "jump" then
+            -- (Janitor) on toward the goal while the path is planned (planning on a phone took seconds: a stand before
+            -- every mess, seen live)
+            hum:MoveTo(target)
+        end
+        local path = computePath(root.Position, target, strict == true, strict == "jump" and 4 or nil)
         if not path then
             return false, "no path"
         end
@@ -353,7 +379,7 @@ local function walkTo(target, strict)
                     break
                 end
             end
-            if jumps or not last
+            if (jumps and strict ~= "jump") or not last
                 or (Vector3.new(last.Position.X, 0, last.Position.Z) - Vector3.new(target.X, 0, target.Z)).Magnitude > 3
                 or math.abs(last.Position.Y - target.Y) > 2.5 then
                 return false, "no path"
@@ -375,6 +401,10 @@ local function walkTo(target, strict)
             if i > 1 then
                 if wp.Action == Enum.PathWaypointAction.Jump then
                     hum.Jump = true
+                    -- (the control script resets Jump every frame: the jump state is set directly)
+                    if strict == "jump" and hum.FloorMaterial ~= Enum.Material.Air then
+                        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                    end
                 end
                 local radius
                 local nextWp = wps[i + 1]
@@ -387,7 +417,28 @@ local function walkTo(target, strict)
                         radius = 0.8
                     end
                 end
-                if moveToPoint(hum, wp.Position, 3, radius, root) then
+                local reachedWp = moveToPoint(hum, wp.Position, 3, radius, root)
+                if not reachedWp and strict == "jump" and running and (farming or ghostOn) and not (walkAbort and walkAbort()) then
+                    -- held up by a chair / couch / ledge: a jump over or onto it toward the waypoint, then on - never at a
+                    -- railing or on the stairs (the user: no climbing the stair railings)
+                    local ahead = Vector3.new(wp.Position.X - root.Position.X, 0, wp.Position.Z - root.Position.Z)
+                    local rail = false
+                    if ahead.Magnitude > 0.1 then
+                        local hit = workspace:Blockcast(CFrame.new(root.Position), Vector3.new(2, 4, 1), ahead.Unit * 3, castParams)
+                        local under = workspace:Raycast(root.Position, Vector3.new(0, -6, 0), castParams)
+                        local n1 = hit and hit.Instance.Name:lower() or ""
+                        local n2 = under and under.Instance.Name:lower() or ""
+                        rail = n1:find("railing") ~= nil or n1:find("stair") ~= nil or n2:find("stair") ~= nil
+                    end
+                    if not rail then
+                        hum.Jump = true
+                        if hum.FloorMaterial ~= Enum.Material.Air then
+                            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                        end
+                        reachedWp = moveToPoint(hum, wp.Position, 2, radius, root)
+                    end
+                end
+                if reachedWp then
                     if walkProgress then
                         walkProgress = os.clock()
                     end
@@ -601,7 +652,133 @@ local function areaOf(spawn)
     return a
 end
 
-function findTrash(rootPos)
+-- Doors and staying inside. Found live: the school's doors are School.Geometry.Doors (6, ObjectData.IsOpen, all closed);
+-- a closed door is a wall for the path finder, so the kitchen was reached by going round outside (out of the school:
+-- the shift ended) and messes behind a door (bathrooms) counted as unreachable. A PathfindingModifier (PassThrough) on a
+-- door's solid parts (this client only) lets paths go through it; the door is opened with its own "I_Open" when the
+-- character comes near it. A path to a mess inside is only taken when every waypoint has a roof over it (inside).
+local helper = { mods = {} }
+function helper.setup()
+    if helper.doors then
+        return
+    end
+    helper.doors = {}
+    local spawns = getJanitorSpawns()
+    local school = spawns and spawns.Parent
+    local folder = school and school:FindFirstChild("Geometry") and school.Geometry:FindFirstChild("Doors")
+    for _, d in ipairs(folder and folder:GetChildren() or {}) do
+        local od = d:FindFirstChild("ObjectData")
+        local isOpen = od and od:FindFirstChild("IsOpen")
+        if isOpen then
+            table.insert(helper.doors, { model = d, isOpen = isOpen })
+            for _, p in ipairs(d:GetDescendants()) do
+                if p:IsA("BasePart") and p.CanCollide then
+                    local m = Instance.new("PathfindingModifier")
+                    m.PassThrough = true
+                    m.Parent = p
+                    table.insert(helper.mods, m)
+                end
+            end
+        end
+    end
+end
+function helper.clear()
+    for _, m in ipairs(helper.mods) do
+        pcall(function()
+            m:Destroy()
+        end)
+    end
+    table.clear(helper.mods)
+    helper.doors = nil
+end
+function helper.openNear(pos)
+    if not helper.doors or os.clock() - (helper.lastOpen or 0) < 0.5 then
+        return
+    end
+    for _, e in ipairs(helper.doors) do
+        local dp = e.model:GetPivot().Position
+        if not e.isOpen.Value and (Vector3.new(dp.X, 0, dp.Z) - Vector3.new(pos.X, 0, pos.Z)).Magnitude < 7 and math.abs(dp.Y - pos.Y) < 8 then
+            helper.lastOpen = os.clock()
+            local ok, gens = pcall(function()
+                return JobHandler.Shared.InteractionData:GetData(e.model, LocalPlayer, {})
+            end)
+            for _, gen in ipairs(ok and type(gens) == "table" and gens or {}) do
+                if type(gen) == "function" then
+                    local okG, text, _, f = pcall(gen)
+                    if okG and text == "I_Open" and type(f) == "function" then
+                        -- only the game's own closure (the door's callback lives in ReplicatedStorage.Modules)
+                        local env = getfenv(f)
+                        local src = env and env.script
+                        local mods = ReplicatedStorage:FindFirstChild("Modules")
+                        if DataService.FireServer == origFireServer and DataService.InvokeServer == origInvokeServer
+                            and not (isexecutorclosure and isexecutorclosure(f)) and typeof(src) == "Instance"
+                            and (src:IsDescendantOf(PlayerModules) or (mods and src:IsDescendantOf(mods))) then
+                            pcall(f)
+                            local t0 = os.clock()
+                            while not e.isOpen.Value and os.clock() - t0 < 1.5 do
+                                task.wait(0.05)
+                            end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+function helper.pathInside(path, needRoof)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = { getJanitorSpawns() }
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character then
+            table.insert(ignore, plr.Character)
+        end
+    end
+    params.FilterDescendantsInstances = ignore
+    local op
+    for _, wp in ipairs(path:GetWaypoints()) do
+        if needRoof and not workspace:Raycast(wp.Position + Vector3.new(0, 3, 0), Vector3.new(0, 80, 0), params) then
+            return false -- (no roof: outside the school)
+        end
+        -- a jump onto / over a railing (the stairs' railings) is no way to go (the user: never climb the railings)
+        if wp.Action == Enum.PathWaypointAction.Jump then
+            if not op then
+                op = OverlapParams.new()
+                op.FilterType = Enum.RaycastFilterType.Exclude
+                op.FilterDescendantsInstances = ignore
+            end
+            for _, p in ipairs(workspace:GetPartBoundsInRadius(wp.Position, 4, op)) do
+                if p.Name:lower():find("railing") then
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
+function findTrash(rootPos, reset)
+    -- reset (Auto Farm turned off): the next start begins again from the first floor (seen live: it went on with the
+    -- second floor's round from before and cleaned there first while the first floor had messes)
+    if reset == "helper" then
+        helper.areaOf = areaOf
+        return helper
+    end
+    if reset then
+        phase = 0
+        table.clear(round)
+        helper.clear()
+        if helper.autoJumpWas ~= nil then
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.AutoJumpEnabled = helper.autoJumpWas
+            end
+            helper.autoJumpWas = nil
+        end
+        return nil
+    end
     local spawns = getJanitorSpawns()
     if not spawns then
         return nil
@@ -613,15 +790,23 @@ function findTrash(rootPos)
         end
     end
     local found = { {}, {}, {} } -- per area: { { obj, spawn, score } }
+    -- messes skipped for a while (a walk to them failed) are only left out while another mess is there: with nothing
+    -- else left they are tried again in the same floor order, so it only waits when no floor has a mess (seen live: walks
+    -- to second floor messes failed from the first floor - "Can't reach trash" on the stairs - each skipped for 120-300 s,
+    -- and it stood on the first floor on "No trash found, waiting" with the second floor's messes still there)
+    local skipped = { {}, {}, {} }
     for _, spawn in ipairs(spawns:GetChildren()) do
         local obj = spawn:FindFirstChild("Object")
-        if obj and obj.Parent == spawn and not (badTrash[obj] and badTrash[obj] > now)
-            and getCleanCallback(obj) and isVisibleTrash(obj) then
+        if obj and obj.Parent == spawn and getCleanCallback(obj) and isVisibleTrash(obj) then
             local pos = obj:GetPivot().Position
             local score = (Vector3.new(pos.X, 0, pos.Z) - Vector3.new(rootPos.X, 0, rootPos.Z)).Magnitude
                 + math.abs(pos.Y - rootPos.Y) * 2
-            table.insert(found[areaOf(spawn)], { obj, spawn, score })
+            local list = (badTrash[obj] and badTrash[obj] > now) and skipped or found
+            table.insert(list[areaOf(spawn)], { obj, spawn, score })
         end
+    end
+    if #found[1] + #found[2] + #found[3] == 0 then
+        found = skipped
     end
     local function nearestOf(list, onlyRound)
         local b
@@ -632,12 +817,14 @@ function findTrash(rootPos)
         end
         return b
     end
-    -- the messes of the area being cleaned that it had when it was started, the nearest first
-    local b = phase > 0 and nearestOf(found[phase], true)
+    -- the area being cleaned is not left while it has any mess (the user: every mess on the first floor - the floor the
+    -- janitor room is on, where the job teleport puts the character - bathrooms included, before going upstairs; seen
+    -- live with the old "messes it had when started" round: it went upstairs with 3-7 new first floor messes waiting)
+    local b = phase > 0 and nearestOf(found[phase], false)
     if b then
         return b[1], b[2]
     end
-    -- those are done: the next area in the order (first floor, second floor, outside) that has a mess, starting from
+    -- that area is clean: the next area in the order (first floor, second floor, outside) that has a mess, starting from
     -- the one after this (the first time: the first floor)
     for k = 1, 3 do
         local a = phase == 0 and k or (phase - 1 + k) % 3 + 1
@@ -755,6 +942,13 @@ local function janitorStep()
         task.wait(1)
         return
     end
+    -- the phone's auto-jump off while cleaning (seen live on mobile: AutoJumpEnabled on, it jumped at the stairs'
+    -- railings when walking into them); the walk's own jumps (over a chair / couch) set the jump state directly
+    local H0 = findTrash(nil, "helper")
+    if H0.autoJumpWas == nil then
+        H0.autoJumpWas = hum.AutoJumpEnabled
+    end
+    hum.AutoJumpEnabled = false
     local obj, spawn = findTrash(root.Position)
     if not obj then
         setStatus("No trash found, waiting")
@@ -765,16 +959,27 @@ local function janitorStep()
     local reached, gaveUp = false, false
     local tStart = os.clock()
     walkProgress = tStart
+    -- doors opened on the way; a mess inside is only walked to inside the school (see findTrash's helper)
+    local H = findTrash(nil, "helper")
+    H.setup()
+    local inside = H.areaOf(spawn) ~= 3
+    walkPathOK = function(p)
+        return H.pathInside(p, inside)
+    end
     walkAbort = function()
+        local _, _, r = getChar()
+        if r then
+            H.openNear(r.Position)
+        end
         local now = os.clock()
         return now - walkProgress > 5 or now - tStart > 60
     end
     for _, stand in ipairs(trashStandPoints(spawn, obj, char, root.Position)) do
         if not (running and farming) then
-            walkAbort, walkProgress = nil, nil
+            walkAbort, walkProgress, walkPathOK = nil, nil, nil
             return
         end
-        local ok, why = walkTo(stand, true)
+        local ok, why = walkTo(stand, "jump")
         if ok then
             reached = true
             break
@@ -784,7 +989,7 @@ local function janitorStep()
             break
         end
     end
-    walkAbort, walkProgress = nil, nil
+    walkAbort, walkProgress, walkPathOK = nil, nil, nil
     if not (running and farming) then
         return
     end
@@ -7568,8 +7773,12 @@ NC.store = (function()
     local rayParams = RaycastParams.new()
     rayParams.FilterType = Enum.RaycastFilterType.Include
 
+    -- while it finishes (turned off with food on the tray) only the trip to the fridge counts as running: the grab loop
+    -- and anything it is in the middle of stop at once (seen live: the grab loop went on during that trip, walked back
+    -- to the food and turned the character around)
+    local finishThread
     local function active()
-        return running and (storing or finishing)
+        return running and (storing or (finishing and coroutine.running() == finishThread))
     end
 
     local function status(text)
@@ -7889,7 +8098,7 @@ NC.store = (function()
             end
         end
         if dropdown then
-            if active() then
+            if running and (storing or finishing) then
                 -- rebuilding thousands of dropdown rows freezes the game for seconds; done once storing ends
                 uiDirty = true
             else
@@ -8329,6 +8538,10 @@ NC.store = (function()
         return out
     end
 
+    -- Fast Grab: measured live, a Take is answered in 0.13-0.15 s and Takes 0.05 s apart were all taken (no cooldown).
+    -- With it on, the next grab follows right after the last one is on the tray, and a food already in reach is taken
+    -- without walking to it first; it still waits for each grab to land, so the tray never goes past 21
+    local fastGrab = false
     local function take(part)
         local before = holding()
         if before >= TRAY_MAX then
@@ -8354,10 +8567,10 @@ NC.store = (function()
                 while active() and os.clock() - t0 < (before > 0 and 2 or 3) do
                     if not part.Parent or holding() > before then
                         closeMenu()
-                        task.wait(0.4 + math.random() * 0.3)
+                        task.wait(fastGrab and 0.05 or 0.4 + math.random() * 0.3)
                         return true
                     end
-                    task.wait(0.1)
+                    task.wait(fastGrab and 0.03 or 0.1)
                 end
                 if before > 0 and active() then
                     -- one take with no answer is not a full tray (a slow answer / food someone else took): the loop only
@@ -8399,6 +8612,81 @@ NC.store = (function()
         return best
     end
 
+    -- Fast Mode: the tray stored one food at a time with the fridge's own "Store..." menu (one entry per food on the
+    -- tray) instead of its "Store All" (measured live: Store All waits 0.7-1.2 s per food on the server, 10 foods 9.6 s;
+    -- one at a time 18 foods in 1.9 s, every one stored). The next food is only stored once the one before has left the
+    -- tray, so it never goes faster than the game takes them; false when it stalls (Store All then does the rest)
+    local fastMode = false
+    local function storeEach(fridge)
+        status("Storing the food one by one")
+        local allText = tr("I_StoreAll", "Store All")
+        local stalls = 0
+        local t0 = os.clock()
+        while active() and holding() > 0 and os.clock() - t0 < 60 do
+            local before = holding()
+            local names = {}
+            pcall(function()
+                local trayObj = JobHandler.Shared.EquipmentService:HasTray(LocalPlayer)
+                local content = trayObj and trayObj:FindFirstChild("_trayContent")
+                for _, f in ipairs(content and content:GetChildren() or {}) do
+                    names[f.Name] = true
+                end
+            end)
+            local m = menuOf(fridge)
+            local si = m and buttonIndex(m, tr("I_Store", "Store"), false)
+            local idx
+            if si then
+                pcall(function()
+                    m:Click(si)
+                end)
+                -- the food entries of the store menu: a food on the tray by its name, else any entry that is not
+                -- Store All / More...
+                local tw = os.clock()
+                while active() and not idx and os.clock() - tw < 1.5 do
+                    -- (only once the store menu is showing - it has Store All: seen live, picking from the fridge's main
+                    -- menu before it changed clicked "Take Ingredients" and opened the Cooking Ingredients window)
+                    local other, inStore, food
+                    for k, v in pairs(m.Buttons) do
+                        local t = tostring(v.Text or ""):gsub("%[ICON:%d+%]", "")
+                        if t == allText then
+                            inStore = true
+                        elseif names[t] then
+                            food = food or k
+                        elseif not other and t ~= "" and not t:find("Store", 1, true) and not t:find("More", 1, true) then
+                            other = k
+                        end
+                    end
+                    idx = inStore and (food or other) or nil
+                    if not idx then
+                        task.wait(0.03)
+                    end
+                end
+            end
+            if idx then
+                pcall(function()
+                    m:Click(idx)
+                end)
+                local tc = os.clock()
+                while active() and holding() >= before and os.clock() - tc < 2 do
+                    task.wait(0.03)
+                end
+            end
+            closeMenu()
+            if holding() >= before then
+                -- not taken (menu not ready / turned down): a little slower, Store All after a few
+                stalls += 1
+                if stalls >= 4 then
+                    return false
+                end
+                task.wait(0.3)
+            else
+                stalls = 0
+            end
+        end
+        closeMenu()
+        return holding() == 0
+    end
+
     local function storeAll()
         local fridge = nearestFridge()
         if not fridge then
@@ -8410,6 +8698,9 @@ NC.store = (function()
         local ap = fridge:FindFirstChild("AttachPos")
         if not (ap and walkTo(ap.WorldPosition, 1.5)) then
             return false
+        end
+        if fastMode and storeEach(fridge) then
+            return true
         end
         local m = menuOf(fridge)
         local idx = m and buttonIndex(m, tr("I_Store", "Store"), false)
@@ -8551,8 +8842,13 @@ NC.store = (function()
                     local taken, why = false, "range"
                     local tries = 0
                     extraZone = (not inside(best.Position, 0)) and tableZone(best) or nil
-                    local spots = standPoints(best)
-                    if #spots == 0 then
+                    -- (Fast Grab: taken from right here when it is in reach - taken live from 9 studs)
+                    if fastGrab and (best.Position - root.Position).Magnitude <= 8 then
+                        taken, why = take(best)
+                    end
+                    local grabbed = taken or why ~= "range"
+                    local spots = grabbed and {} or standPoints(best)
+                    if #spots == 0 and not grabbed then
                         -- no walkable spot inside the fence
                         unreachable[best] = inside(best.Position, 0) and "blocked" or "outside"
                     end
@@ -8637,7 +8933,9 @@ NC.store = (function()
         if running and not finishing and holding() > 0 and plot and atPlot() then
             finishing = true
             task.spawn(function()
+                finishThread = coroutine.running()
                 pcall(storeAll)
+                finishThread = nil
                 finishing = false
                 if not storing then
                     stopWalk()
@@ -8765,6 +9063,22 @@ NC.store = (function()
                 end
             end,
         })
+        StoreTab:CreateToggle({
+            Name = "Fast Grab",
+            CurrentValue = false,
+            Flag = "LFJ_StoreFastGrab",
+            Callback = function(value)
+                fastGrab = value -- food grabbed as fast as the game takes it
+            end,
+        })
+        StoreTab:CreateToggle({
+            Name = "Fast Mode",
+            CurrentValue = false,
+            Flag = "LFJ_StoreFast",
+            Callback = function(value)
+                fastMode = value -- the tray stored one food at a time instead of Store All
+            end,
+        })
         statusLabel = StoreTab:CreateLabel("Status: Idle")
 
         StoreTab:CreateSection("Roommate permissions")
@@ -8834,8 +9148,12 @@ NC.shared = (function()
     local rayParams = RaycastParams.new()
     rayParams.FilterType = Enum.RaycastFilterType.Include
 
+    -- while it finishes (turned off with food on the tray) only the trip to the fridge counts as running: the grab loop
+    -- and anything it is in the middle of stop at once (seen live: the grab loop went on during that trip, walked back
+    -- to the food and turned the character around)
+    local finishThread
     local function active()
-        return running and (storing or finishing)
+        return running and (storing or (finishing and coroutine.running() == finishThread))
     end
 
     local function status(text)
@@ -9195,7 +9513,7 @@ NC.shared = (function()
             end
         end
         if foodDD then
-            if active() then
+            if running and (storing or finishing) then
                 -- rebuilding thousands of dropdown rows freezes the game for seconds; do it once storing ends
                 uiDirty = true
             else
@@ -9416,41 +9734,60 @@ NC.shared = (function()
         end
     end
 
-    local function walkTo(goal, within)
+    -- the path to walk: the first agent whose path is not a long way round, else the shortest one found. Seen live: the
+    -- wide agent's path from the food 21 studs from the fridge went round the whole house (442 studs, a 77 s trip) while
+    -- the smaller agents' paths were 59 / 35 studs; the walk used to take the first path found. Second value: its length
+    local function planShortest(from, goal, startIn)
+        local best, bestLen
+        local direct = (goal - from).Magnitude
+        for _, cfg in ipairs(AGENT_TRIES) do
+            local p = PathfindingService:CreatePath(cfg)
+            -- a path request can hang forever (seen live): give it 4 s, then count it as no path
+            local done, ok = false, false
+            task.spawn(function()
+                ok = pcall(function()
+                    p:ComputeAsync(from, goal)
+                end)
+                done = true
+            end)
+            local tc = os.clock()
+            while not done and active() and os.clock() - tc < 4 do
+                task.wait(0.05)
+            end
+            ok = done and ok
+            if ok and p.Status == Enum.PathStatus.Success and (not startIn or pathInside(p)) then
+                local wps, len = p:GetWaypoints(), 0
+                for i = 2, #wps do
+                    len += (wps[i].Position - wps[i - 1].Position).Magnitude
+                end
+                if not bestLen or len < bestLen then
+                    best, bestLen = p, len
+                end
+                if len <= direct * 1.6 + 20 then
+                    break
+                end
+            end
+            if not active() then
+                break
+            end
+            task.wait(0.1)
+        end
+        return best, bestLen
+    end
+
+    -- abort (optional): the walk stops as soon as it is true (the fridge it walks to was taken meanwhile)
+    local function walkTo(goal, within, abort)
         within = within or 2.5
         local hopped = false
         for _ = 1, 3 do
             local _, hum, root = getChar()
-            if not hum then
+            if not hum or (abort and abort()) then
                 return false
             end
             if (flat(root.Position) - flat(goal)).Magnitude <= within then
                 return true
             end
-            local startIn = inside(root.Position, 0)
-            local path
-            for _, cfg in ipairs(AGENT_TRIES) do
-                local p = PathfindingService:CreatePath(cfg)
-                -- a path request can hang forever (seen live): give it 4 s, then count it as no path
-                local done, ok = false, false
-                local from = root.Position
-                task.spawn(function()
-                    ok = pcall(function()
-                        p:ComputeAsync(from, goal)
-                    end)
-                    done = true
-                end)
-                local tc = os.clock()
-                while not done and active() and os.clock() - tc < 4 do
-                    task.wait(0.05)
-                end
-                ok = done and ok
-                if ok and p.Status == Enum.PathStatus.Success and (not startIn or pathInside(p)) then
-                    path = p
-                    break
-                end
-                task.wait(0.1)
-            end
+            local path = planShortest(root.Position, goal, inside(root.Position, 0))
             if not path then
                 -- wedged between objects (no path from here): hop toward the goal once, over or onto
                 -- what is in the way, then plan again from where it lands
@@ -9473,7 +9810,7 @@ NC.shared = (function()
             end
             local wps = path:GetWaypoints()
             for i, wp in ipairs(wps) do
-                if not active() then
+                if not active() or (abort and abort()) then
                     return false
                 end
                 if i > 1 then
@@ -9642,6 +9979,10 @@ NC.shared = (function()
         return out
     end
 
+    -- Fast Grab: measured live, a Take is answered in 0.13-0.15 s and Takes 0.05 s apart were all taken (no cooldown).
+    -- With it on, the next grab follows right after the last one is on the tray, and a food already in reach is taken
+    -- without walking to it first; it still waits for each grab to land, so the tray never goes past 21
+    local fastGrab = false
     local function take(part)
         local before = holding()
         if before >= TRAY_MAX then
@@ -9667,10 +10008,10 @@ NC.shared = (function()
                 while active() and os.clock() - t0 < (before > 0 and 2 or 3) do
                     if not part.Parent or holding() > before then
                         closeMenu()
-                        task.wait(0.4 + math.random() * 0.3)
+                        task.wait(fastGrab and 0.05 or 0.4 + math.random() * 0.3)
                         return true
                     end
-                    task.wait(0.1)
+                    task.wait(fastGrab and 0.03 or 0.1)
                 end
                 if before > 0 and active() then
                     -- one take with no answer is not a full tray (a slow answer / food someone else took): the loop only
@@ -9686,14 +10027,13 @@ NC.shared = (function()
         return false, sawTake and "failed" or "range"
     end
 
-    local function nearestFridge()
+    -- every fridge on the plot. Found live: a player viewing a fridge's storage is attached to it - its
+    -- AttachPos._attachOccupied (ObjectValue) holds that player - and the fridge then offers nothing (no Store); such a
+    -- fridge is busy
+    local function fridges()
         local house = plot and plot:FindFirstChild("House")
-        local _, _, root = getChar()
-        if not (house and root) then
-            return nil
-        end
-        local best, bd
-        for _, group in ipairs(house:GetChildren()) do
+        local out = {}
+        for _, group in ipairs(house and house:GetChildren() or {}) do
             for _, obj in ipairs(group:GetChildren()) do
                 if obj:FindFirstChild("AttachPos") then
                     local ok, isFridge = pcall(function()
@@ -9701,28 +10041,205 @@ NC.shared = (function()
                         return it and it:IsType("Fridge")
                     end)
                     if ok and isFridge then
-                        local d = (obj:GetPivot().Position - root.Position).Magnitude
-                        if not bd or d < bd then
-                            best, bd = obj, d
-                        end
+                        table.insert(out, obj)
                     end
                 end
             end
         end
-        return best
+        return out
+    end
+
+    local function fridgeBusy(f)
+        local occ = f.Parent and f.AttachPos:FindFirstChild("_attachOccupied")
+        local v = occ and occ.Value
+        return not f.Parent or (v ~= nil and v ~= LocalPlayer)
+    end
+
+    -- Fridge ESP: a box on every fridge of the plot like Food ESP's (blue = free, orange = busy), kept up to date
+    local fridgeEsp, fridgeBoxes, fridgeFolder = false, {}, nil
+    local FRIDGE_FREE, FRIDGE_BUSY = Color3.fromRGB(110, 190, 255), Color3.fromRGB(255, 160, 50)
+    local function syncFridgeESP()
+        local want = {}
+        if fridgeEsp then
+            for _, f in ipairs(fridges()) do
+                want[f] = true
+            end
+        end
+        for f, h in pairs(fridgeBoxes) do
+            if not (want[f] and f.Parent) then
+                h:Destroy()
+                fridgeBoxes[f] = nil
+            end
+        end
+        if next(want) and not (fridgeFolder and fridgeFolder.Parent) then
+            fridgeFolder = Instance.new("Folder")
+            fridgeFolder.Name = "LFJ_SharedFridgeESP"
+            fridgeFolder.Parent = gethui and gethui() or CoreGui
+        end
+        for f in pairs(want) do
+            local h = fridgeBoxes[f]
+            if not h then
+                h = Instance.new("BoxHandleAdornment")
+                h.Adornee = f
+                h.AlwaysOnTop = true
+                h.ZIndex = 1
+                local model = f:FindFirstChild("ObjectModel")
+                local okBox, cf, size = pcall(function()
+                    if model and model:IsA("Model") then
+                        return model:GetBoundingBox()
+                    end
+                end)
+                if okBox and cf and size then
+                    h.CFrame = f.CFrame:ToObjectSpace(cf)
+                    h.Size = size
+                else
+                    h.Size = f.Size
+                end
+                h.Transparency = ESP_FILL_T
+                h.Parent = fridgeFolder
+                fridgeBoxes[f] = h
+            end
+            h.Color3 = fridgeBusy(f) and FRIDGE_BUSY or FRIDGE_FREE
+        end
+    end
+
+    -- the free fridge with the shortest walk (the path's own length; seen live: the nearest fridge was picked by the
+    -- straight line with no busy check, so with munchlaxlv100 at that fridge it walked there, got no Store, and tried the
+    -- same fridge again). Second value: a fridge is there but every one is busy
+    local function nearestFridge()
+        local _, _, root = getChar()
+        if not root then
+            return nil
+        end
+        local best, bd, anyBusy
+        local free = {}
+        for _, f in ipairs(fridges()) do
+            if fridgeBusy(f) then
+                anyBusy = true
+            else
+                table.insert(free, f)
+            end
+        end
+        if #free == 1 then
+            return free[1], anyBusy -- (one free fridge: no need to measure the walk)
+        end
+        for _, f in ipairs(free) do
+            do
+                local goal = f.AttachPos.WorldPosition
+                local _, len = planShortest(root.Position, goal, inside(root.Position, 0))
+                local d = len or (goal - root.Position).Magnitude + 1000 -- (no path found: last)
+                if not bd or d < bd then
+                    best, bd = f, d
+                end
+            end
+        end
+        return best, anyBusy
+    end
+
+    -- Fast Mode: the tray stored one food at a time with the fridge's own "Store..." menu (one entry per food on the
+    -- tray) instead of its "Store All" (measured live: Store All waits 0.7-1.2 s per food on the server, 10 foods 9.6 s;
+    -- one at a time 18 foods in 1.9 s, every one stored). The next food is only stored once the one before has left the
+    -- tray, so it never goes faster than the game takes them; false when it stalls (Store All then does the rest)
+    local fastMode = false
+    local function storeEach(fridge)
+        status("Storing the food one by one")
+        local allText = tr("I_StoreAll", "Store All")
+        local stalls = 0
+        local t0 = os.clock()
+        while active() and holding() > 0 and os.clock() - t0 < 60 do
+            local before = holding()
+            local names = {}
+            pcall(function()
+                local trayObj = JobHandler.Shared.EquipmentService:HasTray(LocalPlayer)
+                local content = trayObj and trayObj:FindFirstChild("_trayContent")
+                for _, f in ipairs(content and content:GetChildren() or {}) do
+                    names[f.Name] = true
+                end
+            end)
+            local m = menuOf(fridge)
+            local si = m and buttonIndex(m, tr("I_Store", "Store"), false)
+            local idx
+            if si then
+                pcall(function()
+                    m:Click(si)
+                end)
+                -- the food entries of the store menu: a food on the tray by its name, else any entry that is not
+                -- Store All / More...
+                local tw = os.clock()
+                while active() and not idx and os.clock() - tw < 1.5 do
+                    -- (only once the store menu is showing - it has Store All: seen live, picking from the fridge's main
+                    -- menu before it changed clicked "Take Ingredients" and opened the Cooking Ingredients window)
+                    local other, inStore, food
+                    for k, v in pairs(m.Buttons) do
+                        local t = tostring(v.Text or ""):gsub("%[ICON:%d+%]", "")
+                        if t == allText then
+                            inStore = true
+                        elseif names[t] then
+                            food = food or k
+                        elseif not other and t ~= "" and not t:find("Store", 1, true) and not t:find("More", 1, true) then
+                            other = k
+                        end
+                    end
+                    idx = inStore and (food or other) or nil
+                    if not idx then
+                        task.wait(0.03)
+                    end
+                end
+            end
+            if idx then
+                pcall(function()
+                    m:Click(idx)
+                end)
+                local tc = os.clock()
+                while active() and holding() >= before and os.clock() - tc < 2 do
+                    task.wait(0.03)
+                end
+            end
+            closeMenu()
+            if holding() >= before then
+                -- not taken (menu not ready / turned down): a little slower, Store All after a few
+                stalls += 1
+                if stalls >= 4 then
+                    return false
+                end
+                task.wait(0.3)
+            else
+                stalls = 0
+            end
+        end
+        closeMenu()
+        return holding() == 0
     end
 
     local function storeAll()
-        local fridge = nearestFridge()
+        -- a fridge taken while walking to it: the walk stops there and goes to the next free one
+        local fridge, ap
+        for _ = 1, 4 do
+            local anyBusy
+            fridge, anyBusy = nearestFridge()
+            if not fridge then
+                status(anyBusy and "Every fridge is in use, waiting" or "No fridge found on that plot")
+                task.wait(anyBusy and 0.5 or 2)
+                return false
+            end
+            status("Walking to the fridge")
+            ap = fridge:FindFirstChild("AttachPos")
+            local f = fridge
+            if ap and walkTo(ap.WorldPosition, 1.5, function()
+                return fridgeBusy(f)
+            end) and not fridgeBusy(f) then
+                break
+            end
+            if not (active() and fridgeBusy(f)) then
+                return false
+            end
+            fridge = nil
+        end
         if not fridge then
-            status("No fridge found on that plot")
-            task.wait(2)
             return false
         end
-        status("Walking to the fridge")
-        local ap = fridge:FindFirstChild("AttachPos")
-        if not (ap and walkTo(ap.WorldPosition, 1.5)) then
-            return false
+        if fastMode and storeEach(fridge) then
+            return true
         end
         local m = menuOf(fridge)
         local idx = m and buttonIndex(m, tr("I_Store", "Store"), false)
@@ -9868,8 +10385,13 @@ NC.shared = (function()
                     local taken, why = false, "range"
                     local tries = 0
                     extraZone = (not inside(best.Position, 0)) and tableZone(best) or nil
-                    local spots = standPoints(best)
-                    if #spots == 0 then
+                    -- (Fast Grab: taken from right here when it is in reach - taken live from 9 studs)
+                    if fastGrab and (best.Position - root.Position).Magnitude <= 8 then
+                        taken, why = take(best)
+                    end
+                    local grabbed = taken or why ~= "range"
+                    local spots = grabbed and {} or standPoints(best)
+                    if #spots == 0 and not grabbed then
                         -- no walkable spot inside the fence
                         unreachable[best] = inside(best.Position, 0) and "blocked" or "outside"
                     end
@@ -9961,7 +10483,9 @@ NC.shared = (function()
         if running and not finishing and holding() > 0 and target and target.Parent and access[target] and plot then
             finishing = true
             task.spawn(function()
+                finishThread = coroutine.running()
                 pcall(storeAll)
+                finishThread = nil
                 finishing = false
                 if not storing then
                     stopWalk()
@@ -9977,7 +10501,7 @@ NC.shared = (function()
     end
 
     local function showTarget(on)
-        for _, f in ipairs({ foodFrame, espFrame, storeFrame, statusFrame }) do
+        for _, f in pairs({ foodFrame, espFrame, M.fridgeEspFrame, storeFrame, M.fastGrabFrame, M.fastFrame, statusFrame }) do
             if f then
                 f.Visible = on
             end
@@ -10083,6 +10607,12 @@ NC.shared = (function()
         stopWalk()
         closeMenu()
         syncESP()
+        fridgeEsp = false
+        pcall(syncFridgeESP)
+        if fridgeFolder then
+            fridgeFolder:Destroy()
+            fridgeFolder = nil
+        end
         for _, c in ipairs(plotConns) do
             pcall(function()
                 c:Disconnect()
@@ -10541,6 +11071,27 @@ NC.shared = (function()
                 end,
             })
         end)
+        local _, fridgeEspFrame = add(function()
+            return StoreTab:CreateToggle({
+                Name = "Fridge ESP",
+                CurrentValue = false,
+                Flag = "LFJ_SharedFridgeESP",
+                Callback = function(value)
+                    fridgeEsp = value
+                    pcall(syncFridgeESP)
+                    if value then
+                        local g = generation
+                        task.spawn(function()
+                            while fridgeEsp and running and generation == g do
+                                task.wait(0.5)
+                                pcall(syncFridgeESP)
+                            end
+                        end)
+                    end
+                end,
+            })
+        end)
+        M.fridgeEspFrame = fridgeEspFrame
         storeToggle, storeFrame = add(function()
             return StoreTab:CreateToggle({
                 Name = "Auto Store",
@@ -10575,6 +11126,28 @@ NC.shared = (function()
                 end,
             })
         end)
+        local _, fastGrabFrame = add(function()
+            return StoreTab:CreateToggle({
+                Name = "Fast Grab",
+                CurrentValue = false,
+                Flag = "LFJ_SharedFastGrab",
+                Callback = function(value)
+                    fastGrab = value -- food grabbed as fast as the game takes it
+                end,
+            })
+        end)
+        M.fastGrabFrame = fastGrabFrame
+        local _, fastFrame = add(function()
+            return StoreTab:CreateToggle({
+                Name = "Fast Mode",
+                CurrentValue = false,
+                Flag = "LFJ_SharedFast",
+                Callback = function(value)
+                    fastMode = value -- the tray stored one food at a time instead of Store All
+                end,
+            })
+        end)
+        M.fastFrame = fastFrame
         statusLabel, statusFrame = add(function()
             return StoreTab:CreateLabel("Status: Idle")
         end)
@@ -20656,6 +21229,7 @@ FarmToggle = JobsTab:CreateToggle({
             pcall(NC.mech.stop)
             pcall(NC.stock.stop)
             pcall(NC.miner.stop)
+            pcall(findTrash, nil, true)
             if selectedJob ~= "Fast Food Worker - Burger Cook" then
                 stopWalking()
             end
@@ -21011,6 +21585,7 @@ getgenv().LegitFarmJob = function()
     pcall(NC.mech.stop)
     pcall(NC.stock.stop)
     pcall(NC.miner.stop)
+    pcall(findTrash, nil, true)
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
