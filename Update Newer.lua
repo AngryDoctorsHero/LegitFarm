@@ -7548,6 +7548,8 @@ NC.store = (function()
     local foods, labelOf, partOf = {}, {}, {}
     local selected = {} -- food part -> true
     local known = setmetatable({}, { __mode = "k" })
+    -- food dropped from the list while selected (streamed out of this client / moved): selected again when it is back
+    local streamedOut = setmetatable({}, { __mode = "k" })
     local deselectedKinds = {}
     local labelStore, labelSeq = setmetatable({}, { __mode = "k" }), {}
     local SELECT_ALL, DESELECT_ALL = "Select All", "Deselect All"
@@ -7873,6 +7875,12 @@ NC.store = (function()
                 if not deselectedKinds[p.Name] then
                     selected[p] = true
                 end
+            elseif streamedOut[p] then
+                -- the same food back after the game streamed it out of this client (StreamingEnabled) / it was moved:
+                -- selected again (it was dropped from the list when it left, and a food seen before was never selected
+                -- again: no ESP, never stored)
+                streamedOut[p] = nil
+                selected[p] = true
             end
         end
         for p in pairs(selected) do
@@ -7918,6 +7926,9 @@ NC.store = (function()
             if gone[p] then
                 local l = labelOf[p]
                 labelOf[p] = nil
+                if selected[p] then
+                    streamedOut[p] = true
+                end
                 selected[p] = nil
                 if l then
                     partOf[l] = nil
@@ -7994,6 +8005,24 @@ NC.store = (function()
         return Vector3.new(v.X, 0, v.Z)
     end
 
+    -- the plot's ground: the plot's own Ground part (250 x 250). Seen live: GroundParts now holds several parts named
+    -- "Ground" (pieces of 140 x 250, 100 x 250, 10 x 240, 10 x 5); FindFirstChild gave a small piece at the far edge, so
+    -- the character on the plot was "not at the plot" and walked toward that piece, outside the fence: "no path from here"
+    local function groundPart()
+        local g = plot and plot:FindFirstChild("Ground")
+        if g and g:IsA("BasePart") then
+            return g
+        end
+        local gp = plot and plot:FindFirstChild("GroundParts")
+        local best
+        for _, c in ipairs(gp and gp:GetChildren() or {}) do
+            if c.Name == "Ground" and c:IsA("BasePart") and (not best or c.Size.X * c.Size.Z > best.Size.X * best.Size.Z) then
+                best = c
+            end
+        end
+        return best
+    end
+
     -- the fenced yard of the plot: walking never goes outside it
     local bounds
     local function plotBounds()
@@ -8017,8 +8046,7 @@ NC.store = (function()
         local box = x0 and { x0 = x0, x1 = x1, z0 = z0, z1 = z1 } or nil
         -- a few loose fence pieces are not a fenced yard: then the plot's ground is the limit
         if not box or box.x1 - box.x0 < 20 or box.z1 - box.z0 < 20 then
-            local gp = plot and plot:FindFirstChild("GroundParts")
-            local g = gp and gp:FindFirstChild("Ground")
+            local g = groundPart()
             if g and g:IsA("BasePart") then
                 box = { x0 = g.Position.X - g.Size.X / 2, x1 = g.Position.X + g.Size.X / 2, z0 = g.Position.Z - g.Size.Z / 2, z1 = g.Position.Z + g.Size.Z / 2 }
             end
@@ -8433,9 +8461,7 @@ NC.store = (function()
 
     -- on the plot = over its ground or near it
     local function plotGround()
-        local gp = plot and plot:FindFirstChild("GroundParts")
-        local g = gp and gp:FindFirstChild("Ground")
-        return g and g:IsA("BasePart") and g or nil
+        return groundPart()
     end
 
     local function atPlot()
@@ -8790,6 +8816,8 @@ NC.shared = (function()
     local failCount = setmetatable({}, { __mode = "k" })
     local labelStore, labelSeq = setmetatable({}, { __mode = "k" }), {}
     local known = setmetatable({}, { __mode = "k" })
+    -- food dropped from the list while selected (streamed out of this client / moved): selected again when it is back
+    local streamedOut = setmetatable({}, { __mode = "k" })
     local deselectedKinds = {}
     local SELECT_ALL, DESELECT_ALL = "Select All", "Deselect All"
     local trayMax
@@ -9153,6 +9181,12 @@ NC.shared = (function()
                 if not deselectedKinds[p.Name] then
                     selected[p] = true
                 end
+            elseif streamedOut[p] then
+                -- the same food back after the game streamed it out of this client (StreamingEnabled) / it was moved:
+                -- selected again (it was dropped from the list when it left, and a food seen before was never selected
+                -- again: no ESP, never stored)
+                streamedOut[p] = nil
+                selected[p] = true
             end
         end
         for p in pairs(selected) do
@@ -9198,6 +9232,9 @@ NC.shared = (function()
             if gone[p] then
                 local l = labelOf[p]
                 labelOf[p] = nil
+                if selected[p] then
+                    streamedOut[p] = true
+                end
                 selected[p] = nil
                 if l then
                     partOf[l] = nil
@@ -9280,6 +9317,24 @@ NC.shared = (function()
         return Vector3.new(v.X, 0, v.Z)
     end
 
+    -- the plot's ground: the plot's own Ground part (250 x 250). Seen live: GroundParts now holds several parts named
+    -- "Ground" (pieces of 140 x 250, 100 x 250, 10 x 240, 10 x 5); FindFirstChild gave the 10 x 5 piece at the far edge, so
+    -- the character on the plot was "not at the plot" and walked toward that piece, outside the fence: "no path from here"
+    local function groundPart()
+        local g = plot and plot:FindFirstChild("Ground")
+        if g and g:IsA("BasePart") then
+            return g
+        end
+        local gp = plot and plot:FindFirstChild("GroundParts")
+        local best
+        for _, c in ipairs(gp and gp:GetChildren() or {}) do
+            if c.Name == "Ground" and c:IsA("BasePart") and (not best or c.Size.X * c.Size.Z > best.Size.X * best.Size.Z) then
+                best = c
+            end
+        end
+        return best
+    end
+
     -- the fenced yard of the plot: walking never goes outside it
     local bounds
     local function plotBounds()
@@ -9303,8 +9358,7 @@ NC.shared = (function()
         local box = x0 and { x0 = x0, x1 = x1, z0 = z0, z1 = z1 } or nil
         -- a few loose fence pieces are not a fenced yard: then the plot's ground is the limit
         if not box or box.x1 - box.x0 < 20 or box.z1 - box.z0 < 20 then
-            local gp = plot and plot:FindFirstChild("GroundParts")
-            local g = gp and gp:FindFirstChild("Ground")
+            local g = groundPart()
             if g and g:IsA("BasePart") then
                 box = { x0 = g.Position.X - g.Size.X / 2, x1 = g.Position.X + g.Size.X / 2, z0 = g.Position.Z - g.Size.Z / 2, z1 = g.Position.Z + g.Size.Z / 2 }
             end
@@ -9721,9 +9775,7 @@ NC.shared = (function()
     -- on the plot = over its ground (250 x 250) or near it. Seen live: the House pivot sits at the plot's edge, so the old
     -- "within 160 studs of the House pivot" said "not at the plot" next to food on the far side (1364 of 1995 objects there)
     local function plotGround()
-        local gp = plot and plot:FindFirstChild("GroundParts")
-        local g = gp and gp:FindFirstChild("Ground")
-        return g and g:IsA("BasePart") and g or nil
+        return groundPart()
     end
 
     local function atPlot()
@@ -10049,6 +10101,355 @@ NC.shared = (function()
         end
     end
 
+    -- Fridge log: when Auto Store starts, a row per selected food on the plot (with its icon): how many the owner's fridge
+    -- holds now -> how many it should hold once these are stored, and the fridge's count as it goes; a count that drops
+    -- (food gone from the fridge) is shown on the row and warned in the console. Found live: the fridge's contents are the
+    -- owner's inventory (ReplicatedStorage.Stats.<owner>.Inventory.<food> = count); the fridge's Store adds to it, its Take
+    -- removes from it
+    local fridgeLog = { rows = {}, gen = 0, FILE = "LFJ_FridgeLog.json" }
+    -- what was put in each player's fridge, kept in a file (and getgenv) so it is still there after a rejoin:
+    -- { [owner name] = { [food] = { n = highest count seen in their fridge, t = os.time() } } }
+    do
+        local HttpService = game:GetService("HttpService")
+        fridgeLog.data = getgenv().LFJ_FridgeLog
+        if type(fridgeLog.data) ~= "table" then
+            fridgeLog.data = {}
+            pcall(function()
+                if isfile and isfile(fridgeLog.FILE) then
+                    local t = HttpService:JSONDecode(readfile(fridgeLog.FILE))
+                    if type(t) == "table" then
+                        fridgeLog.data = t
+                    end
+                end
+            end)
+            getgenv().LFJ_FridgeLog = fridgeLog.data
+        end
+        function fridgeLog.save()
+            if fridgeLog.saving then
+                return
+            end
+            fridgeLog.saving = true
+            task.delay(3, function()
+                fridgeLog.saving = false
+                pcall(function()
+                    if writefile then
+                        writefile(fridgeLog.FILE, HttpService:JSONEncode(fridgeLog.data))
+                    end
+                end)
+            end)
+        end
+    end
+    function fridgeLog.record(owner, name, n)
+        if n <= 0 then
+            return -- (nothing of it in the fridge yet: nothing to log)
+        end
+        local d = fridgeLog.data[owner.Name] or {}
+        fridgeLog.data[owner.Name] = d
+        local e = d[name]
+        if not e or n > e.n then
+            d[name] = { n = n, t = os.time() }
+            fridgeLog.save()
+        end
+    end
+    -- a food count in a logged fridge went down: why, from what can be seen right then. Found live: the only way food
+    -- leaves a fridge is its "Take" (TakeFridgeContent -> RemoveFromInventory, one at a time, into the taker's hand), and
+    -- nothing on the client spoils / expires stored food
+    function fridgeLog.reason(owner, name, from, to)
+        local holder
+        for _, p in ipairs(Players:GetPlayers()) do
+            pcall(function()
+                local ES = JobHandler.Shared.EquipmentService
+                local e = ES:GetEquipped(p)
+                if e and tostring(e) == name then
+                    holder = holder or p
+                end
+                local tray = ES:HasTray(p)
+                local content = tray and tray:FindFirstChild("_trayContent")
+                for _, f in ipairs(content and content:GetChildren() or {}) do
+                    if f.Name == name then
+                        holder = holder or p
+                    end
+                end
+            end)
+        end
+        local diff = from - to
+        if holder then
+            return "taken out by " .. holder.DisplayName .. " (@" .. holder.Name .. "), seen holding it"
+        elseif diff >= 3 then
+            return string.format("%d removed at once with nobody holding it: removed by the game, not taken by a player (a save rollback / reset of %s's data)", diff, owner.Name)
+        end
+        return "taken out, nobody seen holding it (eaten right away, or taken by someone out of view)"
+    end
+    function fridgeLog.event(owner, name, from, to, reason)
+        local d = fridgeLog.data[owner.Name] or {}
+        fridgeLog.data[owner.Name] = d
+        d._events = type(d._events) == "table" and d._events or {}
+        table.insert(d._events, 1, { f = name, a = from, b = to, r = reason, t = os.time() })
+        while #d._events > 40 do
+            table.remove(d._events)
+        end
+        fridgeLog.save()
+        warn(string.format("[Legit Farm Job] fridge log: %s in %s's fridge went from %d to %d - %s", name, owner.Name, from, to, reason))
+    end
+    function fridgeLog.count(owner, name)
+        local st = ReplicatedStorage:FindFirstChild("Stats")
+        local inv = st and st:FindFirstChild(owner.Name)
+        inv = inv and inv:FindFirstChild("Inventory")
+        local v = inv and inv:FindFirstChild(name)
+        return v and v:IsA("ValueBase") and tonumber(v.Value) or 0
+    end
+    function fridgeLog.text(r, name)
+        return string.format("%s: %d → %d | in the fridge now: %d%s", name, r.base, r.expect, r.now,
+            r.lost > 0 and string.format(" | %d gone from the fridge", r.lost) or "")
+    end
+    function fridgeLog.row(name)
+        local r = fridgeLog.rows[name]
+        if r then
+            if r.frame then
+                r.frame.Visible = true
+            end
+            return r
+        end
+        if not (fridgeLog.tab and fridgeLog.add) then
+            return nil
+        end
+        local label, frame = fridgeLog.add(function()
+            return fridgeLog.tab:CreateLabel(name)
+        end)
+        r = { label = label, frame = frame }
+        -- the food's icon in front of it, like the food dropdown's rows
+        pcall(function()
+            local it = JobHandler.Items:GetItem(name)
+            local title = frame and frame:FindFirstChild("Title")
+            if it and it.Icon and title then
+                local img = Instance.new("ImageLabel")
+                img.Name = "RowIcon"
+                img.BackgroundTransparency = 1
+                img.Image = "rbxassetid://" .. tostring(it.Icon)
+                img.Size = UDim2.fromOffset(24, 24)
+                img.AnchorPoint = Vector2.new(0, 0.5)
+                img.Position = UDim2.new(0, 10, 0.5, 0)
+                img.Parent = frame
+                title.Position = UDim2.new(title.Position.X.Scale, title.Position.X.Offset + 30, title.Position.Y.Scale, title.Position.Y.Offset)
+                title.Size = UDim2.new(title.Size.X.Scale, title.Size.X.Offset - 30, title.Size.Y.Scale, title.Size.Y.Offset)
+            end
+        end)
+        fridgeLog.rows[name] = r
+        return r
+    end
+    function fridgeLog.hide()
+        for _, r in pairs(fridgeLog.rows) do
+            r.active = false
+            if r.frame then
+                r.frame.Visible = false
+            end
+        end
+    end
+    function fridgeLog.start(owner)
+        fridgeLog.gen += 1
+        local myGen = fridgeLog.gen
+        fridgeLog.hide()
+        local onPlot = {}
+        for _, p in ipairs(foods) do
+            if selected[p] and p.Parent then
+                onPlot[p.Name] = (onPlot[p.Name] or 0) + 1
+            end
+        end
+        withUiIdentity(function()
+            if fridgeLog.headerFrame then
+                fridgeLog.headerFrame.Visible = true
+            end
+            if fridgeLog.header then
+                fridgeLog.header:Set("Fridge log (" .. owner.DisplayName .. "'s fridge): before → after storing")
+            end
+            for name, n in pairs(onPlot) do
+                local r = fridgeLog.row(name)
+                if r then
+                    r.base = fridgeLog.count(owner, name)
+                    r.expect, r.now, r.lost, r.active = r.base + n, r.base, 0, true
+                    fridgeLog.record(owner, name, r.base)
+                    r.label:Set(fridgeLog.text(r, name))
+                end
+            end
+        end)
+        task.spawn(function()
+            while running and fridgeLog.gen == myGen and target == owner do
+                for name, r in pairs(fridgeLog.rows) do
+                    if r.active then
+                        local c = fridgeLog.count(owner, name)
+                        if c ~= r.now then
+                            if c < r.now then
+                                r.lost += r.now - c -- (the reason is worked out and logged by the fridge watcher)
+                            end
+                            r.now = c
+                            fridgeLog.record(owner, name, c)
+                            withUiIdentity(function()
+                                r.label:Set(fridgeLog.text(r, name))
+                            end)
+                        end
+                    end
+                end
+                task.wait(1)
+            end
+        end)
+    end
+
+    -- Fridge Logs tab: every food saved for a player, the count stored -> the count in their fridge now (read from their
+    -- inventory while they are in the server), and how many are gone
+    local logTab = { rows = {} }
+    function logTab.owners()
+        local list = {}
+        for name in pairs(fridgeLog.data) do
+            table.insert(list, name)
+        end
+        table.sort(list, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        return list
+    end
+    function logTab.render(ownerName)
+        if not (logTab.tab and logTab.summary) then
+            return
+        end
+        logTab.shown = ownerName
+        local d = ownerName and fridgeLog.data[ownerName] or {}
+        local plr = ownerName and Players:FindFirstChild(ownerName)
+        local foodsList = {}
+        for name, e in pairs(d) do
+            if type(e) == "table" and (e.n or 0) > 0 then
+                table.insert(foodsList, name)
+            end
+        end
+        table.sort(foodsList)
+        local gone, last = 0, 0
+        -- every logged food lower than stored = the whole save went back, not single takes
+        logTab.allDown = false
+        if plr and #foodsList > 1 then
+            local down = 0
+            for _, name in ipairs(foodsList) do
+                if fridgeLog.count(plr, name) < d[name].n then
+                    down += 1
+                end
+            end
+            logTab.allDown = down == #foodsList
+        end
+        withUiIdentity(function()
+            for _, r in pairs(logTab.rows) do
+                if r.frame then
+                    r.frame.Visible = false
+                end
+            end
+            for _, name in ipairs(foodsList) do
+                local e = d[name]
+                last = math.max(last, e.t or 0)
+                local r = logTab.rows[name]
+                if not r then
+                    local before = {}
+                    for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                        before[c] = true
+                    end
+                    local label = logTab.tab:CreateLabel(name)
+                    local frame
+                    for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                        if not before[c] and c:IsA("GuiObject") then
+                            frame = c
+                        end
+                    end
+                    r = { label = label, frame = frame }
+                    pcall(function()
+                        local it = JobHandler.Items:GetItem(name)
+                        local title = frame and frame:FindFirstChild("Title")
+                        if it and it.Icon and title then
+                            local img = Instance.new("ImageLabel")
+                            img.Name = "RowIcon"
+                            img.BackgroundTransparency = 1
+                            img.Image = "rbxassetid://" .. tostring(it.Icon)
+                            img.Size = UDim2.fromOffset(24, 24)
+                            img.AnchorPoint = Vector2.new(0, 0.5)
+                            img.Position = UDim2.new(0, 10, 0.5, 0)
+                            img.Parent = frame
+                            title.Position = UDim2.new(title.Position.X.Scale, title.Position.X.Offset + 30, title.Position.Y.Scale, title.Position.Y.Offset)
+                            title.Size = UDim2.new(title.Size.X.Scale, title.Size.X.Offset - 30, title.Size.Y.Scale, title.Size.Y.Offset)
+                        end
+                    end)
+                    logTab.rows[name] = r
+                end
+                if r.frame then
+                    r.frame.Visible = true
+                end
+                local text
+                if plr then
+                    local now = fridgeLog.count(plr, name)
+                    local miss = math.max(e.n - now, 0)
+                    gone += miss
+                    local why = ""
+                    if miss > 0 then
+                        -- the reason seen when it went down, else it went while nothing was watching
+                        for _, ev in ipairs(type(d._events) == "table" and d._events or {}) do
+                            if ev.f == name then
+                                why = ": " .. ev.r
+                                break
+                            end
+                        end
+                        if why == "" then
+                            why = ": gone while the script was not watching (after " .. os.date("%b %d %I:%M %p", e.t or 0) .. ")"
+                                .. (logTab.allDown and ", every logged food went down - looks like a save rollback" or "")
+                        end
+                    end
+                    text = string.format("%s: %d stored → %d in the fridge now%s", name, e.n, now,
+                        miss > 0 and string.format(" | %d DISAPPEARED%s", miss, why) or " | all there")
+                else
+                    text = string.format("%s: %d stored (fridge not visible: not in this server)", name, e.n)
+                end
+                r.label:Set(text)
+            end
+            local summary
+            if not ownerName then
+                summary = "No fridge logged yet: food stored with Auto Store (Roommate permissions) shows up here"
+            else
+                local who = plr and (plr.DisplayName .. " (@" .. ownerName .. ")") or ("@" .. ownerName)
+                summary = string.format("%s: %d foods logged, last stored %s", who, #foodsList,
+                    last > 0 and os.date("%b %d %I:%M %p", last) or "?")
+                    .. (plr and (gone > 0 and string.format(" | %d gone from the fridge", gone) or " | nothing gone") or " | not in this server")
+            end
+            logTab.summary:Set(summary)
+            -- Disappearances: what went down while it was watched, newest first, with the reason
+            local evs = type(d._events) == "table" and d._events or {}
+            if logTab.evHeader then
+                logTab.evHeader:Set(#evs > 0 and ("Disappearances (" .. #evs .. "), newest first:") or "Disappearances: none seen")
+            end
+            logTab.evRows = logTab.evRows or {}
+            for i = 1, math.max(#evs, #logTab.evRows) do
+                local ev = evs[i]
+                local r = logTab.evRows[i]
+                if ev and not r and i <= 20 then
+                    local before = {}
+                    for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                        before[c] = true
+                    end
+                    local label = logTab.tab:CreateLabel("")
+                    local frame
+                    for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                        if not before[c] and c:IsA("GuiObject") then
+                            frame = c
+                        end
+                    end
+                    r = { label = label, frame = frame }
+                    logTab.evRows[i] = r
+                end
+                if r then
+                    if r.frame then
+                        r.frame.Visible = ev ~= nil
+                    end
+                    if ev then
+                        r.label:Set(string.format("%s - %s: %d → %d, %s", os.date("%b %d %I:%M %p", ev.t or 0), ev.f, ev.a, ev.b, ev.r))
+                    end
+                end
+            end
+        end)
+        return gone
+    end
+
     function M.buildUI(StoreTab)
         local page
         for _, root in ipairs({ gethui and gethui() or CoreGui, CoreGui }) do
@@ -10154,6 +10555,7 @@ NC.shared = (function()
                             return
                         end
                         storing = true
+                        pcall(fridgeLog.start, target)
                         task.spawn(function()
                             -- an error never turns it off: the loop starts again until the toggle is turned off
                             while storing and running do
@@ -10175,6 +10577,102 @@ NC.shared = (function()
         end)
         statusLabel, statusFrame = add(function()
             return StoreTab:CreateLabel("Status: Idle")
+        end)
+        fridgeLog.header, fridgeLog.headerFrame = add(function()
+            return StoreTab:CreateLabel("Fridge log: turn Auto Store on to see each food's fridge count (before → after)")
+        end)
+        fridgeLog.tab, fridgeLog.add = StoreTab, add
+        if fridgeLog.headerFrame then
+            fridgeLog.headerFrame.Visible = false -- (shown once Auto Store starts for a player)
+        end
+        -- the Fridge Logs tab (right after the Auto Store tab)
+        local LogTab = Window:CreateTab("Fridge Logs", "clipboard-list")
+        logTab.tab = LogTab
+        for _, root in ipairs({ gethui and gethui() or CoreGui, CoreGui }) do
+            local rf = root:FindFirstChild("Rayfield")
+            local el = rf and rf:FindFirstChild("Main") and rf.Main:FindFirstChild("Elements")
+            logTab.page = logTab.page or (el and el:FindFirstChild("Fridge Logs"))
+        end
+        LogTab:CreateSection("Food put in a fridge with Auto Store (Roommate permissions)")
+        local owners = logTab.owners()
+        logTab.dropdown = LogTab:CreateDropdown({
+            Name = "Player",
+            Options = owners,
+            CurrentOption = owners[1] and { owners[1] } or {},
+            MultipleOptions = false,
+            Flag = "LFJ_FridgeLogPlayer",
+            Callback = function(option)
+                local name = type(option) == "table" and option[1] or option
+                if name and fridgeLog.data[name] then
+                    logTab.render(name)
+                end
+            end,
+        })
+        LogTab:CreateButton({
+            Name = "Check now",
+            Callback = function()
+                local list = logTab.owners()
+                withUiIdentity(function()
+                    logTab.dropdown:Refresh(list)
+                    if logTab.shown then
+                        logTab.dropdown:Set({ logTab.shown })
+                    end
+                end)
+                logTab.render(logTab.shown or list[1])
+            end,
+        })
+        logTab.summary = LogTab:CreateLabel("Fridge log")
+        logTab.evHeader = LogTab:CreateLabel("Disappearances: none seen")
+        logTab.evRows = {}
+        for i = 1, 10 do
+            local before = {}
+            for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                before[c] = true
+            end
+            local label = LogTab:CreateLabel("")
+            local frame
+            for _, c in ipairs(logTab.page and logTab.page:GetChildren() or {}) do
+                if not before[c] and c:IsA("GuiObject") then
+                    frame = c
+                end
+            end
+            if frame then
+                frame.Visible = false
+            end
+            logTab.evRows[i] = { label = label, frame = frame }
+        end
+        logTab.render(owners[1])
+        -- the fridge watcher: every logged fridge whose owner is in the server, checked every 2 s (with or without Auto
+        -- Store on); a count that goes down is logged with its reason
+        local watchGen = generation
+        task.spawn(function()
+            local seen = {}
+            while running and generation == watchGen do
+                for ownerName, d in pairs(fridgeLog.data) do
+                    local plr = Players:FindFirstChild(ownerName)
+                    if plr then
+                        seen[ownerName] = seen[ownerName] or {}
+                        local changed = false
+                        for name, e in pairs(d) do
+                            if type(e) == "table" and (e.n or 0) > 0 then
+                                local c = fridgeLog.count(plr, name)
+                                local prev = seen[ownerName][name]
+                                if prev and c < prev then
+                                    pcall(fridgeLog.event, plr, name, prev, c, fridgeLog.reason(plr, name, prev, c))
+                                    changed = true
+                                end
+                                seen[ownerName][name] = c
+                            end
+                        end
+                        if changed and logTab.shown == ownerName then
+                            pcall(logTab.render, ownerName)
+                        end
+                    else
+                        seen[ownerName] = nil
+                    end
+                end
+                task.wait(2)
+            end
         end)
         showTarget(false)
         if playerFrame then
@@ -10213,9 +10711,29 @@ NC.shared = (function()
         task.spawn(function()
             while running and generation == myGeneration do
                 local before = target
+                local had = {}
+                for plr in pairs(access) do
+                    had[plr] = true
+                end
                 local ok, err = pcall(pollAccess)
                 if not ok then
                     warn("[Legit Farm Job] access check: " .. tostring(err))
+                end
+                -- access given (again) by a player whose fridge is logged: the Fridge Logs tab checks it right away
+                for plr in pairs(access) do
+                    if not had[plr] and fridgeLog.data[plr.Name] then
+                        local okR, gone = pcall(logTab.render, plr.Name)
+                        pcall(function()
+                            withUiIdentity(function()
+                                logTab.dropdown:Refresh(logTab.owners())
+                                logTab.dropdown:Set({ plr.Name })
+                            end)
+                        end)
+                        if okR and type(gone) == "number" then
+                            notify(plr, "Fridge log checked", labelFor(plr) .. "'s fridge: "
+                                .. (gone > 0 and (gone .. " stored foods are gone (see the Fridge Logs tab)") or "everything stored is still there"))
+                        end
+                    end
                 end
                 if before and not access[before] then
                     onAccessLost(before)
