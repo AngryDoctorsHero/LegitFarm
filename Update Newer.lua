@@ -39,7 +39,7 @@ local JOB_IDS = {
     ["Fast Food Worker - Burger Cook"] = CASH_ID, [PIZZA_NAME] = PIZZA_ID, [TEACHER_NAME] = TEACHER_ID,
     ["BFF Supermarket"] = "SupermarketCashier", ["Hairdresser - Stylez Hair Studio"] = "StylezHairdresser",
     ["Fisherman - Fishing Hut"] = "HutFisherman", ["Mechanic - Mike's Motors"] = "MikesMechanic",
-    ["Stocker - BFF Supermarket"] = "SupermarketStocker",
+    ["Stocker - BFF Supermarket"] = "SupermarketStocker", ["Miner - The Bloxburg Cave"] = "CaveMiner",
 }
 local CHOP_RANGE = 6
 local MAX_SWINGS = 25
@@ -7534,13 +7534,15 @@ NC.mood = (function()
     return M
 end)()
 
--- Auto Store (food on the player's own plot)
+-- Auto Store (food on the player's own plot): the same storing as the roommate section below (NC.shared), on the
+-- player's own plot - food on tables / counters and on the floor, the tray filled to 21, every side of a table tried,
+-- walking inside the fence only (jumps when blocked), never turning itself off
 NC.store = (function()
     local S = {}
     local CoreGui = game:GetService("CoreGui")
     local UserInputService = game:GetService("UserInputService")
-    local ESP_FILL, ESP_FILL_T, ESP_LINE = Color3.fromRGB(255, 120, 120), 0.55, Color3.fromRGB(255, 190, 190)
-    local HOVER_FILL, HOVER_FILL_T, HOVER_LINE = Color3.fromRGB(255, 30, 30), 0.1, Color3.fromRGB(255, 255, 255)
+    local ESP_FILL, ESP_FILL_T = Color3.fromRGB(255, 120, 120), 0.55
+    local HOVER_FILL, HOVER_FILL_T = Color3.fromRGB(255, 30, 30), 0.1
 
     local plot
     local foods, labelOf, partOf = {}, {}, {}
@@ -7550,19 +7552,22 @@ NC.store = (function()
     local labelStore, labelSeq = setmetatable({}, { __mode = "k" }), {}
     local SELECT_ALL, DESELECT_ALL = "Select All", "Deselect All"
     local highlights = {}
-    local dropdown, statusLabel, lastStatus
-    local suppress = false
-    local espOn, storing = false, false
-    local plotConns, inputConns = {}, {}
-    local pending = false
-    local espFolder
-    local hovered
     local badUntil = {} -- food part -> time it may be tried again
+    local unreachable = setmetatable({}, { __mode = "k" })
+    local failCount = setmetatable({}, { __mode = "k" })
+    local trayMax
+    local TRAY_MAX = 21
+    local dropdown, statusLabel, lastStatus, toggleObj
+    local suppress, espOn, storing, finishing, pending = false, false, false, false, false
+    local plotConns, inputConns = {}, {}
+    local espFolder, hovered
+    local uiDirty = false
+    local toPlotAt = 0
     local rayParams = RaycastParams.new()
     rayParams.FilterType = Enum.RaycastFilterType.Include
 
     local function active()
-        return running and storing
+        return running and (storing or finishing)
     end
 
     local function status(text)
@@ -7582,8 +7587,14 @@ NC.store = (function()
     end
 
     -- Food on the plot
+    -- food put down on the floor is a part straight in a House group (House.Objects), not in an ItemHolder
+    local function onFloor(part)
+        local g = part.Parent
+        return g ~= nil and g.Parent ~= nil and g.Parent.Name == "House" and g.Parent.Parent == plot
+    end
+
     local function foodData(part)
-        if part:IsA("BasePart") and part.Parent and part.Parent.Name == "ItemHolder" then
+        if part:IsA("BasePart") and part.Parent and (part.Parent.Name == "ItemHolder" or onFloor(part)) then
             local ok, it = pcall(function()
                 return JobHandler.Items:GetItem(part.Name)
             end)
@@ -7620,6 +7631,8 @@ NC.store = (function()
                 local ih = obj:FindFirstChild("ItemHolder")
                 if ih then
                     scan(ih)
+                elseif foodData(obj) then
+                    table.insert(out, obj)
                 end
             end
         end
@@ -7627,26 +7640,34 @@ NC.store = (function()
     end
 
     local function relabel(list)
+        -- sort keys read once per part (reading Name / Position inside the sort was a freeze on every grab)
+        local key = {}
+        for _, p in ipairs(list) do
+            local pos = p.Position
+            key[p] = { p.Name, pos.X, pos.Z }
+        end
         table.sort(list, function(a, b)
-            if a.Name ~= b.Name then
-                return a.Name < b.Name
+            local ka, kb = key[a], key[b]
+            if ka[1] ~= kb[1] then
+                return ka[1] < kb[1]
             end
-            if math.abs(a.Position.X - b.Position.X) > 0.01 then
-                return a.Position.X < b.Position.X
+            if math.abs(ka[2] - kb[2]) > 0.01 then
+                return ka[2] < kb[2]
             end
-            return a.Position.Z < b.Position.Z
+            return ka[3] < kb[3]
         end)
         local newCount = {}
         for _, p in ipairs(list) do
             if not labelStore[p] then
-                newCount[p.Name] = (newCount[p.Name] or 0) + 1
+                newCount[key[p][1]] = (newCount[key[p][1]] or 0) + 1
             end
         end
         for _, p in ipairs(list) do
             if not labelStore[p] then
-                local seq = (labelSeq[p.Name] or 0) + 1
-                labelSeq[p.Name] = seq
-                labelStore[p] = (seq == 1 and newCount[p.Name] == 1) and p.Name or (p.Name .. " #" .. seq)
+                local name = key[p][1]
+                local seq = (labelSeq[name] or 0) + 1
+                labelSeq[name] = seq
+                labelStore[p] = (seq == 1 and newCount[name] == 1) and name or (name .. " #" .. seq)
             end
         end
         labelOf, partOf = {}, {}
@@ -7701,12 +7722,13 @@ NC.store = (function()
         end
     end
 
+    -- box adornments: Highlight is capped at 31 and SelectionBox lags with thousands
     local function styleNormal(h)
-        h.FillColor, h.FillTransparency, h.OutlineColor, h.OutlineTransparency = ESP_FILL, ESP_FILL_T, ESP_LINE, 0.15
+        h.Color3, h.Transparency = ESP_FILL, ESP_FILL_T
     end
 
     local function styleHover(h)
-        h.FillColor, h.FillTransparency, h.OutlineColor, h.OutlineTransparency = HOVER_FILL, HOVER_FILL_T, HOVER_LINE, 0
+        h.Color3, h.Transparency = HOVER_FILL, HOVER_FILL_T
     end
 
     local function setHover(p)
@@ -7751,9 +7773,22 @@ NC.store = (function()
             end
             for p in pairs(selected) do
                 if p.Parent and not highlights[p] then
-                    local h = Instance.new("Highlight")
-                    h.Adornee = p:FindFirstChild("ObjectModel") or p
-                    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    local h = Instance.new("BoxHandleAdornment")
+                    h.Adornee = p
+                    h.AlwaysOnTop = true
+                    h.ZIndex = 1
+                    local model = p:FindFirstChild("ObjectModel")
+                    local okBox, cf, size = pcall(function()
+                        if model and model:IsA("Model") then
+                            return model:GetBoundingBox()
+                        end
+                    end)
+                    if okBox and cf and size then
+                        h.CFrame = p.CFrame:ToObjectSpace(cf)
+                        h.Size = size
+                    else
+                        h.Size = Vector3.new(1.2, 1.2, 1.2)
+                    end
                     styleNormal(h)
                     h.Parent = espFolder
                     highlights[p] = h
@@ -7846,29 +7881,78 @@ NC.store = (function()
             end
         end
         if dropdown then
-            local options = { SELECT_ALL, DESELECT_ALL }
-            for _, p in ipairs(foods) do
-                table.insert(options, labelOf[p])
+            if active() then
+                -- rebuilding thousands of dropdown rows freezes the game for seconds; done once storing ends
+                uiDirty = true
+            else
+                uiDirty = false
+                local options = { SELECT_ALL, DESELECT_ALL }
+                for _, p in ipairs(foods) do
+                    table.insert(options, labelOf[p])
+                end
+                suppress = true
+                withUiIdentity(function()
+                    dropdown:Refresh(options)
+                end)
+                suppress = false
+                decorate()
+                setDropdownSelection()
             end
-            suppress = true
-            withUiIdentity(function()
-                dropdown:Refresh(options)
-            end)
-            suppress = false
-            decorate()
-            setDropdownSelection()
         end
         syncESP()
     end
 
-    local function scheduleRefresh()
+    -- food that was only taken away (a grab) is dropped from the lists without scanning / sorting the whole plot again
+    local removedPending, fullPending = {}, false
+    local function quickRemove()
+        pending = false
+        local gone = removedPending
+        removedPending = {}
+        if next(gone) == nil then
+            return
+        end
+        local keep = {}
+        local frame = dropdownFrame()
+        local list = frame and frame:FindFirstChild("List")
+        for _, p in ipairs(foods) do
+            if gone[p] then
+                local l = labelOf[p]
+                labelOf[p] = nil
+                selected[p] = nil
+                if l then
+                    partOf[l] = nil
+                    local row = list and list:FindFirstChild(l)
+                    if row then
+                        row.Visible = false -- the dropdown row of a taken food (the next full refresh rebuilds the list)
+                    end
+                end
+            else
+                keep[#keep + 1] = p
+            end
+        end
+        foods = keep
+        syncESP()
+    end
+
+    local function scheduleRefresh(removed)
+        if removed then
+            removedPending[removed] = true
+        else
+            fullPending = true
+        end
         if pending or not running then
             return
         end
         pending = true
         task.delay(0.4, function()
             if running then
-                refresh()
+                if fullPending then
+                    fullPending = false
+                    table.clear(removedPending)
+                    refresh()
+                else
+                    quickRemove()
+                end
             else
                 pending = false
             end
@@ -7885,13 +7969,13 @@ NC.store = (function()
         plot = findPlot()
         if plot then
             table.insert(plotConns, plot.DescendantAdded:Connect(function(d)
-                if d.Parent and d.Parent.Name == "ItemHolder" then
+                if d.Parent and (d.Parent.Name == "ItemHolder" or (d:IsA("BasePart") and onFloor(d))) then
                     scheduleRefresh()
                 end
             end))
             table.insert(plotConns, plot.DescendantRemoving:Connect(function(d)
-                if d.Parent and d.Parent.Name == "ItemHolder" then
-                    scheduleRefresh()
+                if d.Parent and (d.Parent.Name == "ItemHolder" or (d:IsA("BasePart") and onFloor(d))) then
+                    scheduleRefresh(d)
                 end
             end))
         end
@@ -7910,30 +7994,141 @@ NC.store = (function()
         return Vector3.new(v.X, 0, v.Z)
     end
 
-    local function walkTo(target, within)
+    -- the fenced yard of the plot: walking never goes outside it
+    local bounds
+    local function plotBounds()
+        if bounds and bounds.plot == plot then
+            return bounds.box
+        end
+        local house = plot and plot:FindFirstChild("House")
+        local fences = house and house:FindFirstChild("Fences")
+        local x0, x1, z0, z1
+        for _, d in ipairs(fences and fences:GetDescendants() or {}) do
+            if d:IsA("BasePart") then
+                local p, s = d.Position, d.Size
+                local ex = (math.abs(d.CFrame.RightVector.X) * s.X + math.abs(d.CFrame.UpVector.X) * s.Y + math.abs(d.CFrame.LookVector.X) * s.Z) / 2
+                local ez = (math.abs(d.CFrame.RightVector.Z) * s.X + math.abs(d.CFrame.UpVector.Z) * s.Y + math.abs(d.CFrame.LookVector.Z) * s.Z) / 2
+                x0 = math.min(x0 or p.X - ex, p.X - ex)
+                x1 = math.max(x1 or p.X + ex, p.X + ex)
+                z0 = math.min(z0 or p.Z - ez, p.Z - ez)
+                z1 = math.max(z1 or p.Z + ez, p.Z + ez)
+            end
+        end
+        local box = x0 and { x0 = x0, x1 = x1, z0 = z0, z1 = z1 } or nil
+        -- a few loose fence pieces are not a fenced yard: then the plot's ground is the limit
+        if not box or box.x1 - box.x0 < 20 or box.z1 - box.z0 < 20 then
+            local gp = plot and plot:FindFirstChild("GroundParts")
+            local g = gp and gp:FindFirstChild("Ground")
+            if g and g:IsA("BasePart") then
+                box = { x0 = g.Position.X - g.Size.X / 2, x1 = g.Position.X + g.Size.X / 2, z0 = g.Position.Z - g.Size.Z / 2, z1 = g.Position.Z + g.Size.Z / 2 }
+            end
+        end
+        if box then
+            bounds = { plot = plot, box = box }
+        end
+        return box
+    end
+
+    -- a table that sits in an opening of the fence is part of the food area: while a food on it is the target, that
+    -- table's footprint counts as inside
+    local extraZone
+    local function inside(v, pad, mainOnly)
+        local b = plotBounds()
+        if not b or (v.X > b.x0 + pad and v.X < b.x1 - pad and v.Z > b.z0 + pad and v.Z < b.z1 - pad) then
+            return true
+        end
+        local z = not mainOnly and extraZone or nil
+        return z ~= nil and v.X > z.x0 + pad and v.X < z.x1 - pad and v.Z > z.z0 + pad and v.Z < z.z1 - pad
+    end
+
+    local function tableZone(food)
+        local obj = food.Parent and food.Parent.Name == "ItemHolder" and food.Parent.Parent
+        local x0, x1, z0, z1
+        for _, d in ipairs(obj and obj:GetDescendants() or {}) do
+            if d.Name == "PlaceAll" and d:IsA("BasePart") then
+                local cf, s = d.CFrame, d.Size
+                local ex = (math.abs(cf.RightVector.X) * s.X + math.abs(cf.UpVector.X) * s.Y + math.abs(cf.LookVector.X) * s.Z) / 2
+                local ez = (math.abs(cf.RightVector.Z) * s.X + math.abs(cf.UpVector.Z) * s.Y + math.abs(cf.LookVector.Z) * s.Z) / 2
+                x0 = math.min(x0 or cf.X - ex, cf.X - ex)
+                x1 = math.max(x1 or cf.X + ex, cf.X + ex)
+                z0 = math.min(z0 or cf.Z - ez, cf.Z - ez)
+                z1 = math.max(z1 or cf.Z + ez, cf.Z + ez)
+            end
+        end
+        return x0 and { x0 = x0 - 1.5, x1 = x1 + 1.5, z0 = z0 - 1.5, z1 = z1 + 1.5 } or nil
+    end
+
+    local function pathInside(p)
+        for i, wp in ipairs(p:GetWaypoints()) do
+            if i > 1 and not inside(wp.Position, 0.8) then
+                return false
+            end
+        end
+        return true
+    end
+
+    -- the player's control script resets Humanoid.Jump every frame, so the jump state is set directly
+    local function hop(hum)
+        hum.Jump = true
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+
+    local function walkTo(goal, within)
         within = within or 2.5
+        local hopped = false
         for _ = 1, 3 do
             local _, hum, root = getChar()
             if not hum then
                 return false
             end
-            if (flat(root.Position) - flat(target)).Magnitude <= within then
+            if (flat(root.Position) - flat(goal)).Magnitude <= within then
                 return true
             end
+            local startIn = inside(root.Position, 0)
             local path
             for _, cfg in ipairs(AGENT_TRIES) do
                 local p = PathfindingService:CreatePath(cfg)
-                local ok = pcall(function()
-                    p:ComputeAsync(root.Position, target)
+                -- a path request can hang forever: give it 4 s, then count it as no path
+                local done, ok = false, false
+                local from = root.Position
+                task.spawn(function()
+                    ok = pcall(function()
+                        p:ComputeAsync(from, goal)
+                    end)
+                    done = true
                 end)
-                if ok and p.Status == Enum.PathStatus.Success then
+                local tc = os.clock()
+                while not done and active() and os.clock() - tc < 4 do
+                    task.wait(0.05)
+                end
+                ok = done and ok
+                if ok and p.Status == Enum.PathStatus.Success and (not startIn or pathInside(p)) then
                     path = p
                     break
                 end
                 task.wait(0.1)
             end
             if not path then
-                return false
+                -- wedged between objects (no path from here): hop toward the goal once, over or onto what is in the
+                -- way, then plan again from where it lands
+                if hopped then
+                    return false
+                end
+                hopped = true
+                local dir = flat(goal) - flat(root.Position)
+                dir = dir.Magnitude > 0.1 and dir.Unit or root.CFrame.LookVector
+                hum:MoveTo(root.Position + dir * 4)
+                hop(hum)
+                local th = os.clock()
+                while active() and os.clock() - th < 0.9 do
+                    RunService.Heartbeat:Wait()
+                end
+                if not active() then
+                    return false
+                end
+                continue
             end
             local wps = path:GetWaypoints()
             for i, wp in ipairs(wps) do
@@ -7950,6 +8145,7 @@ NC.store = (function()
                     end)
                     hum:MoveTo(wp.Position)
                     local t0, refPos, refT = os.clock(), root.Position, os.clock()
+                    local jumps = 0
                     while active() and not finished and os.clock() - t0 < 3 do
                         local rp = root.Position
                         if i < #wps and (flat(rp) - flat(wp.Position)).Magnitude <= 1.8 then
@@ -7958,7 +8154,14 @@ NC.store = (function()
                         end
                         if os.clock() - refT > 0.8 then
                             if (flat(rp) - flat(refPos)).Magnitude < 0.5 then
-                                break
+                                -- blocked by objects: jump over or onto them (twice at most), then re-plan
+                                if jumps >= 2 then
+                                    break
+                                end
+                                jumps += 1
+                                hum:MoveTo(wp.Position)
+                                hop(hum)
+                                t0 += 0.8
                             end
                             refPos, refT = rp, os.clock()
                         end
@@ -7971,7 +8174,7 @@ NC.store = (function()
                 end
             end
             local _, _, r2 = getChar()
-            if r2 and (flat(r2.Position) - flat(target)).Magnitude <= within + 0.5 then
+            if r2 and (flat(r2.Position) - flat(goal)).Magnitude <= within + 0.5 then
                 return true
             end
             task.wait(0.1)
@@ -8044,14 +8247,52 @@ NC.store = (function()
         params.FilterType = Enum.RaycastFilterType.Exclude
         params.FilterDescendantsInstances = { char }
         local pos = part.Position
+        local skip = { char }
+        -- food lying on the floor sits at ground height: ground just has to be below its top
+        local groundBelow = onFloor(part) and pos.Y + 0.5 or pos.Y - 0.5
+        local function floorFood(inst)
+            local a = inst
+            while a and a ~= plot do
+                if a:IsA("BasePart") and onFloor(a) and foodData(a) then
+                    return a
+                end
+                a = a.Parent
+            end
+        end
+        -- the game lets you take food from about 10 studs, and tables are 15 wide: the middle of a table is only
+        -- reachable from the aisle 8-9 studs away. One spot per side (the closest one), so a blocked side falls back
+        -- to another.
         for a = 0, 315, 45 do
-            for _, r in ipairs({ 3, 2.2 }) do
+            local found, top, topR = false, nil, nil
+            for _, r in ipairs({ 2.2, 3, 4, 5, 6, 7, 8, 8.75 }) do
                 local x = pos.X + math.cos(math.rad(a)) * r
                 local z = pos.Z + math.sin(math.rad(a)) * r
-                local hit = workspace:Raycast(Vector3.new(x, pos.Y + 1, z), Vector3.new(0, -16, 0), params)
-                if hit and hit.Position.Y < pos.Y - 1.5 and hit.Instance.CanCollide then
-                    table.insert(out, { hit.Position, (hit.Position - root.Position).Magnitude })
+                -- other food on the floor is not ground: look through it
+                local hit, ff
+                for _ = 1, 6 do
+                    hit = workspace:Raycast(Vector3.new(x, pos.Y + 1, z), Vector3.new(0, -16, 0), params)
+                    ff = hit and floorFood(hit.Instance)
+                    if hit and (hit.Instance:FindFirstAncestor("ItemHolder") or ff) then
+                        table.insert(skip, ff or hit.Instance)
+                        params.FilterDescendantsInstances = skip
+                    else
+                        break
+                    end
                 end
+                if hit and hit.Position.Y < groundBelow and hit.Instance.CanCollide and not hit.Instance:FindFirstAncestor("ItemHolder") and not ff
+                    and inside(hit.Position, 1, true) then
+                    table.insert(out, { hit.Position, r * 100 + (hit.Position - root.Position).Magnitude })
+                    found = true
+                    break
+                elseif not top and extraZone and hit and hit.Instance.Name == "PlaceAll" and math.abs(hit.Position.Y - pos.Y) < 0.6
+                    and inside(hit.Position, 1) then
+                    top = hit.Position
+                    topR = r
+                end
+            end
+            if not found and top then
+                -- food on a table that fills a fence opening: stand on that table
+                table.insert(out, { top, 1000 + topR * 100 + (top - root.Position).Magnitude })
             end
         end
         table.sort(out, function(p, q)
@@ -8062,9 +8303,13 @@ NC.store = (function()
 
     local function take(part)
         local before = holding()
+        if before >= TRAY_MAX then
+            return false, "full"
+        end
+        local sawTake = false
         for _ = 1, 3 do
             if not active() then
-                return false
+                return false, "stopped"
             end
             if not part.Parent then
                 return true
@@ -8072,12 +8317,13 @@ NC.store = (function()
             local m = menuOf(part)
             local idx = m and buttonIndex(m, tr("I_Take", "Take"), true)
             if idx then
+                sawTake = true
                 status("Taking " .. part.Name)
                 pcall(function()
                     m:Click(idx)
                 end)
                 local t0 = os.clock()
-                while active() and os.clock() - t0 < 3 do
+                while active() and os.clock() - t0 < (before > 0 and 2 or 3) do
                     if not part.Parent or holding() > before then
                         closeMenu()
                         task.wait(0.4 + math.random() * 0.3)
@@ -8085,12 +8331,18 @@ NC.store = (function()
                     end
                     task.wait(0.1)
                 end
+                if before > 0 and active() then
+                    -- one take with no answer is not a full tray (a slow answer / food someone else took): the loop only
+                    -- calls the tray full when two different foods are refused at the same count
+                    closeMenu()
+                    return false, "full"
+                end
             else
                 task.wait(0.3)
             end
             closeMenu()
         end
-        return false
+        return false, sawTake and "failed" or "range"
     end
 
     local function nearestFridge()
@@ -8172,32 +8424,92 @@ NC.store = (function()
         local out = {}
         local now = os.clock()
         for _, p in ipairs(foods) do
-            if selected[p] and p.Parent and not (badUntil[p] and badUntil[p] > now) and p:GetAttribute("_updateModel") ~= -1 then
+            if selected[p] and p.Parent and not unreachable[p] and not (badUntil[p] and badUntil[p] > now) and p:GetAttribute("_updateModel") ~= -1 then
                 table.insert(out, p)
             end
         end
         return out
     end
 
-    local function loop()
-        if holding() > 0 then
-            storing = false
-            S.setToggle(false)
-            status("Put away what you are holding first")
+    -- on the plot = over its ground or near it
+    local function plotGround()
+        local gp = plot and plot:FindFirstChild("GroundParts")
+        local g = gp and gp:FindFirstChild("Ground")
+        return g and g:IsA("BasePart") and g or nil
+    end
+
+    local function atPlot()
+        if not plot then
+            return false
+        end
+        local _, _, root = getChar()
+        local g = plotGround()
+        if not (root and g) then
+            return false
+        end
+        local rel = g.CFrame:PointToObjectSpace(root.Position)
+        return math.abs(rel.X) < g.Size.X / 2 + 40 and math.abs(rel.Z) < g.Size.Z / 2 + 40
+    end
+
+    -- walking only, never a teleport: toward the plot along pathfinding waypoints
+    local function goToPlot()
+        if os.clock() - toPlotAt < 3 then
             return
         end
+        toPlotAt = os.clock()
+        local g = plotGround()
+        local _, _, root = getChar()
+        if not (g and root) then
+            status("Walk to your plot")
+            return
+        end
+        status("Walking to your plot")
+        local c = g.Position
+        local d = flat(root.Position) - flat(c)
+        local edge = d.Magnitude > 1 and flat(c) + d.Unit * math.min(d.Magnitude, g.Size.X / 2 - 10) or flat(c)
+        if not walkTo(Vector3.new(edge.X, g.Position.Y + 3, edge.Z), 4) and active() then
+            status("Walk to your plot (no path from here)")
+        end
+    end
+
+    local function loop()
         local full = false
         while active() do
             local _, hum, root = getChar()
             if not hum then
                 status("Waiting for character")
                 task.wait(1)
+            elseif not atPlot() then
+                if not plot then
+                    watchPlot()
+                end
+                goToPlot()
+                task.wait(0.5)
             else
                 local list = targets()
                 local held = holding()
-                if full or (#list == 0 and held > 0) then
+                -- the tray holds 21: at 21 it goes to the fridge, it never tries to take a 22nd ("Your tray is full")
+                if held >= TRAY_MAX then
+                    full = true
+                end
+                -- food that is only skipped for a few seconds is still to be taken: the tray is not stored half full
+                local waiting = false
+                if #list == 0 and held > 0 and not full then
+                    local now = os.clock()
+                    for _, p in ipairs(foods) do
+                        if selected[p] and p.Parent and not unreachable[p] and badUntil[p] and badUntil[p] > now then
+                            waiting = true
+                            break
+                        end
+                    end
+                end
+                if waiting then
+                    status("Waiting to try the skipped food again (" .. held .. " on the tray)")
+                    task.wait(0.5)
+                elseif full or (#list == 0 and held > 0) then
                     if storeAll() then
                         full = false
+                        trayMax = nil
                     else
                         task.wait(1)
                     end
@@ -8210,29 +8522,71 @@ NC.store = (function()
                         end
                     end
                     status("Walking to the " .. best.Name)
-                    local reached = false
-                    for _, sp in ipairs(standPoints(best)) do
-                        if not active() then
+                    local taken, why = false, "range"
+                    local tries = 0
+                    extraZone = (not inside(best.Position, 0)) and tableZone(best) or nil
+                    local spots = standPoints(best)
+                    if #spots == 0 then
+                        -- no walkable spot inside the fence
+                        unreachable[best] = inside(best.Position, 0) and "blocked" or "outside"
+                    end
+                    for _, sp in ipairs(spots) do
+                        if not active() or tries >= 4 then
                             break
                         end
                         if walkTo(sp[1], 1.2) then
-                            reached = true
-                            break
-                        end
-                    end
-                    if reached and active() then
-                        if not take(best) and active() then
-                            if holding() > 0 then
-                                full = true
-                            else
-                                badUntil[best] = os.clock() + 30
+                            tries += 1
+                            taken, why = take(best)
+                            if taken or why ~= "range" then
+                                break
                             end
                         end
-                    elseif active() then
-                        badUntil[best] = os.clock() + 30
+                    end
+                    extraZone = nil
+                    if not taken and active() and not unreachable[best] then
+                        if why == "full" then
+                            -- trayMax: { n = tray count, p = the food refused at it }; a second, different food refused
+                            -- at the same count = the tray is full
+                            local n = holding()
+                            if type(trayMax) == "table" and trayMax.n == n and (trayMax.p ~= best or #list <= 1) then
+                                full = true
+                            else
+                                trayMax = { n = n, p = best }
+                                badUntil[best] = os.clock() + 5
+                            end
+                        else
+                            -- every side was tried: after 3 rounds give up on it instead of looping
+                            failCount[best] = (failCount[best] or 0) + 1
+                            if failCount[best] >= 3 then
+                                unreachable[best] = inside(best.Position, 0) and "blocked" or "outside"
+                            else
+                                badUntil[best] = os.clock() + 10
+                            end
+                        end
                     end
                 else
-                    status("All selected food is stored")
+                    local left, outsideN, blockedN = 0, 0, 0
+                    for _, p in ipairs(foods) do
+                        if selected[p] and p.Parent then
+                            if unreachable[p] == "outside" then
+                                outsideN += 1
+                            elseif unreachable[p] then
+                                blockedN += 1
+                            else
+                                left += 1
+                            end
+                        end
+                    end
+                    local skipText = (outsideN > 0 and (outsideN .. " skipped, outside the fence") or "")
+                        .. (outsideN > 0 and blockedN > 0 and ", " or "")
+                        .. (blockedN > 0 and (blockedN .. " skipped, no way to reach them") or "")
+                    if left == 0 and outsideN + blockedN == 0 then
+                        status("All selected food is stored")
+                    elseif left == 0 then
+                        status("Stored everything it can reach: " .. skipText)
+                    else
+                        status("Can't reach " .. left .. " selected food, trying again" .. (skipText ~= "" and (", " .. skipText) or ""))
+                    end
                     task.wait(1)
                 end
             end
@@ -8240,7 +8594,7 @@ NC.store = (function()
         end
     end
 
-    function S.stop()
+    function S.stop(reason)
         storing = false
         stopWalk()
         closeMenu()
@@ -8252,10 +8606,26 @@ NC.store = (function()
                 JobHandler.Modules.CharacterHandler:Detach()
             end)
         end
-        status("Idle")
+        status(reason or "Idle")
+        -- food still on the tray when it is turned off goes into the fridge first
+        if running and not finishing and holding() > 0 and plot and atPlot() then
+            finishing = true
+            task.spawn(function()
+                pcall(storeAll)
+                finishing = false
+                if not storing then
+                    stopWalk()
+                    status(reason or "Idle")
+                    if uiDirty then
+                        scheduleRefresh()
+                    end
+                end
+            end)
+        elseif uiDirty then
+            scheduleRefresh()
+        end
     end
 
-    local toggleObj
     function S.setToggle(v)
         if toggleObj then
             withUiIdentity(function()
@@ -8265,9 +8635,9 @@ NC.store = (function()
     end
 
     function S.shutdown()
-        storing = false
-        espOn = false
-        pcall(S.stop)
+        storing, finishing, espOn = false, false, false
+        stopWalk()
+        closeMenu()
         syncESP()
         for _, c in ipairs(plotConns) do
             pcall(function()
@@ -8352,17 +8722,19 @@ NC.store = (function()
                     end
                     storing = true
                     task.spawn(function()
-                        local ok, err = pcall(loop)
-                        if not ok then
-                            warn("[Legit Farm Job] auto store: " .. tostring(err))
-                            status("Error, stopped")
-                        end
-                        if storing then
-                            storing = false
-                            S.setToggle(false)
+                        -- an error never turns it off: the loop starts again until the toggle is turned off
+                        while storing and running do
+                            local ok, err = pcall(loop)
+                            if not ok then
+                                warn("[Legit Farm Job] auto store: " .. tostring(err))
+                                status("Error, retrying")
+                                stopWalk()
+                                closeMenu()
+                                task.wait(1)
+                            end
                         end
                     end)
-                else
+                elseif storing then
                     S.stop()
                 end
             end,
@@ -18948,6 +19320,520 @@ NC.stock = (function()
     return K
 end)()
 
+-- Miner - The Bloxburg Cave (job id CaveMiner). Found live in the game's own JobHandler.CaveMiner: the mine is a 12 x 12
+-- grid of 4-stud blocks over Environment.Locations.Mountains.Cave.Static_MinerCave.Geometry.MineBase, made on this client
+-- in a Folder in workspace._game (the job's GameFolder), each block named "x:layer:z" (layer 1 = the top). A block is a
+-- clone of ReplicatedStorage.GameObjects.JobAssets.MinerBlocks: 1 stone, 2-5 ore (Slate), 10 TNT (Wood, Bright red - mining
+-- it lights the fuse and blows up). Its "I_Mine" interaction plays the MineBlock animation (looped, StopOnMove) and asks
+-- the server (MineBlock); measured live: ~5.1 s later the server removes the block (RemoveMineBlock), the animation stops
+-- and the block under it appears (NewMineBlock), so the mine goes deeper one block at a time. Mined from up to 9.1 studs.
+NC.miner = (function()
+    local M = {}
+    local JOB = "CaveMiner"
+    local REACH = 9 -- from the character's middle to the block's middle (mined live from 9.1)
+    local AGENTS = {
+        { AgentRadius = 1.5, AgentHeight = 5, AgentCanJump = true },
+        { AgentRadius = 1, AgentHeight = 5, AgentCanJump = true },
+    }
+    local bad = setmetatable({}, { __mode = "k" }) -- block -> time it may be tried again
+    local folderCache
+    local outerSetStatus = setStatus
+    local function setStatus(text)
+        if farming then
+            outerSetStatus(text)
+        end
+    end
+
+    local function alive()
+        return running and farming and isWorkingJob(JOB)
+    end
+
+    local function flatDist(a, b)
+        return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+    end
+
+    -- the Folder in workspace._game the game makes the blocks in
+    local function blockFolder()
+        if folderCache and folderCache.Parent then
+            return folderCache
+        end
+        local g = workspace:FindFirstChild("_game")
+        for _, c in ipairs(g and g:GetChildren() or {}) do
+            local f = c:IsA("Folder") and c:GetChildren()[1]
+            if f and f.Name:match("^%-?%d+:%-?%d+:%-?%d+$") then
+                folderCache = c
+                return c
+            end
+        end
+    end
+
+    local function layerOf(b)
+        return tonumber(b.Name:match("^%-?%d+:(%-?%d+):")) or 0
+    end
+
+    -- MinerBlocks 10: the only Wood (Bright red) block
+    local function isTNT(b)
+        local pp = b.PrimaryPart
+        return pp == nil or pp.Material == Enum.Material.Wood or pp.BrickColor == BrickColor.new("Bright red")
+    end
+
+    local function mineCallback(b)
+        local reg = getInteractRegistry()
+        local entry = reg and reg[b]
+        for _, gen in ipairs(type(entry) == "table" and type(entry[1]) == "table" and entry[1] or {}) do
+            if type(gen) == "function" then
+                local ok, text, _, cb = pcall(gen)
+                if ok and text == "I_Mine" and type(cb) == "function" then
+                    return cb
+                end
+            end
+        end
+    end
+
+    local function use(cb)
+        if not cleanSafe(cb) then
+            farming = false
+            if FarmToggle then
+                withUiIdentity(function()
+                    FarmToggle:Set(false)
+                end)
+            end
+            outerSetStatus("Stopped: unsafe miner state")
+            return false
+        end
+        task.spawn(function()
+            pcall(cb)
+        end)
+        return true
+    end
+
+    local function hop(hum)
+        hum.Jump = true
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+
+    local function stopWalk()
+        local _, hum, root = getChar()
+        if hum and root then
+            hum:MoveTo(root.Position)
+        end
+    end
+
+    local function ignoreList()
+        local ignore = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character then
+                table.insert(ignore, plr.Character)
+            end
+        end
+        return ignore
+    end
+
+    -- close to a block (right next to it, not mined from the edge of the reach - the user), in reach, and not standing on
+    -- top of it (mining the block under the feet drops the character into the hole)
+    local CLOSE = 6
+    local function inReach(p, b)
+        local c = b.PrimaryPart.Position
+        local fd = flatDist(p, c)
+        return fd <= CLOSE and (p - c).Magnitude <= REACH and not (fd < 2.6 and p.Y > c.Y)
+    end
+
+    -- where to stand for a block: the top of whatever is next to it (a block or the floor at the edge), one block off
+    -- each side along the mine's own grid (seen live: the mine is turned ~105 degrees, steps along the world axes put the
+    -- spots between blocks and the walk stood and jumped at the edge)
+    local mineBase
+    local function standSpots(b, from)
+        local c = b.PrimaryPart.Position
+        if not (mineBase and mineBase.Parent) then
+            local n = workspace:FindFirstChild("Environment")
+            for _, name in ipairs({ "Locations", "Mountains", "Cave", "Static_MinerCave", "Geometry", "MineBase" }) do
+                n = n and n:FindFirstChild(name)
+            end
+            mineBase = n
+        end
+        local ax = mineBase and mineBase.CFrame.RightVector or Vector3.xAxis
+        local az = mineBase and mineBase.CFrame.LookVector or Vector3.zAxis
+        ax = Vector3.new(ax.X, 0, ax.Z).Unit * 4
+        az = Vector3.new(az.X, 0, az.Z).Unit * 4
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignoreList()
+        local out = {}
+        for _, o in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }) do
+            local q = c + ax * o[1] + az * o[2]
+            local h = workspace:Raycast(Vector3.new(q.X, c.Y + 10, q.Z), Vector3.new(0, -30, 0), params)
+            if h and h.Instance.CanCollide and h.Position.Y <= c.Y + 3.5 and h.Position.Y >= c.Y - 6 then
+                local hb = h.Instance:FindFirstAncestorOfClass("Model")
+                if not (hb and hb.Parent == b.Parent and isTNT(hb)) then
+                    table.insert(out, { p = h.Position, d = (h.Position - from).Magnitude })
+                end
+            end
+        end
+        table.sort(out, function(a, q)
+            return a.d < q.d
+        end)
+        return out
+    end
+
+    local function plan(from, to)
+        for _, cfg in ipairs(AGENTS) do
+            local p = PathfindingService:CreatePath(cfg)
+            local ok = pcall(function()
+                p:ComputeAsync(from, to)
+            end)
+            if ok and p.Status == Enum.PathStatus.Success then
+                local wps = p:GetWaypoints()
+                if #wps > 0 and flatDist(wps[#wps].Position, to) < 3 then
+                    return wps
+                end
+            end
+        end
+    end
+
+    -- Humanoid:MoveTo toward a point 3 studs ahead on the pathfinding line (only ever forward along it), a jump at the
+    -- path's jump waypoints; done as soon as `arrive` is true (still walking). No headway for 0.9 s (on a floating block,
+    -- a ledge, between blocks): a jump toward the goal, then planned again from where it lands
+    local function walk(goal, arrive, abort, tries)
+        for attempt = 1, tries or 4 do
+            if not alive() or (abort and abort()) then
+                return false
+            end
+            local _, hum, root = getChar()
+            if not (hum and root) then
+                return false
+            end
+            if arrive(root.Position) then
+                return true
+            end
+            -- walking toward the goal while the path is planned (seen live: the first path after the mine is made takes
+            -- seconds; standing still for it, then jumping, was the stop at the start)
+            if attempt == 1 then
+                hum:MoveTo(goal)
+            end
+            local wps = plan(root.Position, goal)
+            if not wps then
+                -- no path from here (standing on a block in the air / boxed in): straight at the goal, a jump only when
+                -- that makes no headway, then planned again
+                hum:MoveTo(goal)
+                local t0, ref, refT = os.clock(), root.Position, os.clock()
+                while alive() and os.clock() - t0 < 3 do
+                    if arrive(root.Position) then
+                        return true
+                    end
+                    if os.clock() - refT > 0.6 then
+                        if flatDist(root.Position, ref) < 0.5 then
+                            hop(hum)
+                            hum:MoveTo(goal)
+                        end
+                        ref, refT = root.Position, os.clock()
+                    end
+                    RunService.Heartbeat:Wait()
+                end
+                continue
+            end
+            local line, jumpAt = {}, {}
+            for i, w in ipairs(wps) do
+                line[i] = w.Position
+                jumpAt[i] = w.Action == Enum.PathWaypointAction.Jump
+            end
+            local seg, stuck = 1, false
+            local ref, refT = root.Position, os.clock()
+            local lastAim, lastMoveT = nil, 0
+            while alive() and not (abort and abort()) do
+                local p = root.Position
+                if arrive(p) then
+                    return true
+                end
+                while seg < #line - 1 do
+                    local a, b = line[seg], line[seg + 1]
+                    local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                    local l2 = ab:Dot(ab)
+                    local t = l2 > 1e-6 and Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2 or 1
+                    if t >= 1 or flatDist(p, b) <= 1.5 then
+                        seg += 1
+                    else
+                        break
+                    end
+                end
+                -- a jump waypoint coming up (a step up onto a block): jump when close to it
+                local nextI = seg + 1
+                if jumpAt[nextI] and flatDist(p, line[nextI]) < 3 then
+                    jumpAt[nextI] = false
+                    hop(hum)
+                end
+                local a, b = line[seg], line[seg + 1] or line[seg]
+                local ab = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+                local l2 = ab:Dot(ab)
+                local t = l2 > 1e-6 and math.clamp(Vector3.new(p.X - a.X, 0, p.Z - a.Z):Dot(ab) / l2, 0, 1) or 1
+                local cur, left, aim = a:Lerp(b, t), 3, line[#line]
+                local k = seg
+                while k < #line do
+                    local nxt = line[k + 1]
+                    local d = flatDist(cur, nxt)
+                    if d >= left then
+                        aim = cur:Lerp(nxt, d > 1e-6 and left / d or 1)
+                        break
+                    end
+                    left -= d
+                    cur = nxt
+                    k += 1
+                end
+                if flatDist(p, aim) < 1.5 then
+                    if seg < #line - 1 then
+                        seg += 1
+                        aim = line[seg + 1]
+                    else
+                        aim = goal
+                    end
+                end
+                local spd = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
+                if not lastAim or flatDist(aim, lastAim) > 0.3 or os.clock() - lastMoveT > 0.5
+                    or (spd < 2 and os.clock() - lastMoveT > 0.15) then
+                    hum:MoveTo(aim)
+                    lastAim, lastMoveT = aim, os.clock()
+                end
+                if os.clock() - refT > 0.9 then
+                    if flatDist(p, ref) < 0.5 then
+                        stuck = true
+                        break
+                    end
+                    ref, refT = p, os.clock()
+                end
+                RunService.Heartbeat:Wait()
+            end
+            if not stuck then
+                return false
+            end
+            -- stuck: a jump toward the next point, then planned again
+            hum:MoveTo(line[math.min(seg + 1, #line)])
+            hop(hum)
+            local t0 = os.clock()
+            while alive() and os.clock() - t0 < 0.6 do
+                RunService.Heartbeat:Wait()
+            end
+        end
+        return false
+    end
+
+    -- the block to mine next: the top layer first (the mine stays level, no deep holes / blocks left in the air), the
+    -- nearest one of it; TNT never
+    local function pickBlock(folder, root)
+        local now = os.clock()
+        local best, bestLayer, bestD
+        -- a block with TNT on the straight line to it comes last (seen live: walking straight at it ran into the TNT and
+        -- the character stood while a way round was planned, boxed in by the TNT)
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Include
+        rp.FilterDescendantsInstances = { folder }
+        local function tntInWay(b)
+            local from = root.Position
+            local to = b.PrimaryPart.Position
+            local h = workspace:Raycast(from, to - from, rp)
+            local m = h and h.Instance:FindFirstAncestorOfClass("Model")
+            return m ~= nil and m ~= b and isTNT(m)
+        end
+        for _, b in ipairs(folder:GetChildren()) do
+            if b.PrimaryPart and not isTNT(b) and not (bad[b] and bad[b] > now) then
+                local layer = layerOf(b)
+                local d = (b.PrimaryPart.Position - root.Position).Magnitude
+                if (not best or layer <= bestLayer) and tntInWay(b) then
+                    d += 100
+                end
+                if not best or layer < bestLayer or (layer == bestLayer and d < bestD) then
+                    best, bestLayer, bestD = b, layer, d
+                end
+            end
+        end
+        return best
+    end
+
+    -- a block of the layer being mined that can be mined from right here (watched live: a player's farm stands at one spot
+    -- and mines everything in reach before moving on), the nearest; one layer at a time, TNT never
+    local function pickInReach(folder, root, layer)
+        local now = os.clock()
+        local p = root.Position
+        local best, bestD
+        for _, b in ipairs(folder:GetChildren()) do
+            if b.PrimaryPart and layerOf(b) == layer and not isTNT(b) and not (bad[b] and bad[b] > now) and inReach(p, b) then
+                local d = (b.PrimaryPart.Position - p).Magnitude
+                if not best or d < bestD then
+                    best, bestD = b, d
+                end
+            end
+        end
+        return best
+    end
+
+    -- straight at the block until it is in reach (the user: no going round by the sides); false when that makes no headway
+    local function straightTo(b, hum, root)
+        local c = b.PrimaryPart.Position
+        local t0, ref, refT = os.clock(), root.Position, os.clock()
+        local hops = 0
+        hum:MoveTo(Vector3.new(c.X, root.Position.Y, c.Z))
+        while alive() and b.Parent and os.clock() - t0 < 6 do
+            if inReach(root.Position, b) then
+                return true
+            end
+            if os.clock() - refT > 0.6 then
+                if flatDist(root.Position, ref) < 0.5 then
+                    -- below the level of the layer being mined (in a deeper hole): jumps up the step on the way (the
+                    -- user: allowed to jump when not on the right layer level)
+                    if hops < 3 and root.Position.Y - 3 < c.Y - 3 then
+                        hops += 1
+                        hop(hum)
+                        hum:MoveTo(Vector3.new(c.X, root.Position.Y, c.Z))
+                    else
+                        return false
+                    end
+                end
+                ref, refT = root.Position, os.clock()
+            end
+            RunService.Heartbeat:Wait()
+        end
+        return inReach(root.Position, b)
+    end
+
+    local function hasPickaxe()
+        local ok, e = pcall(function()
+            return JobHandler.Shared.EquipmentService:GetEquipped(LocalPlayer)
+        end)
+        return ok and tostring(e) == "Pickaxe"
+    end
+
+    function M.step()
+        if not farming then
+            task.wait(0.3)
+            return
+        end
+        if not isWorkingJob(JOB) then
+            setStatus("Start the Miner - The Bloxburg Cave job first")
+            task.wait(1)
+            return
+        end
+        local _, hum, root = getChar()
+        if not hum then
+            setStatus("Waiting for character")
+            task.wait(1)
+            return
+        end
+        if not hasPickaxe() then
+            setStatus("Waiting for the Pickaxe")
+            task.wait(0.5)
+            return
+        end
+        local folder = blockFolder()
+        if not folder then
+            setStatus("Waiting for the mine")
+            task.wait(1)
+            return
+        end
+        local b = pickBlock(folder, root)
+        b = b and pickInReach(folder, root, layerOf(b)) or b
+        if not b then
+            setStatus("No block to mine, waiting")
+            task.wait(0.5)
+            return
+        end
+        local function gone()
+            return b.Parent == nil
+        end
+        if not inReach(root.Position, b) then
+            setStatus("Walking to a block (layer " .. layerOf(b) .. ")")
+            local reached = straightTo(b, hum, root)
+            for i, sp in ipairs(reached and {} or standSpots(b, root.Position)) do
+                if i > 2 or not alive() then
+                    break
+                end
+                if walk(sp.p, function(p)
+                    return inReach(p, b)
+                end, gone, 2) then
+                    reached = true
+                    break
+                end
+                if gone() then
+                    return
+                end
+            end
+            if not reached then
+                if alive() and not gone() then
+                    -- (a block left in the air / walled in: skipped for a while, the mining goes on - not walked back to
+                    -- every few seconds)
+                    bad[b] = os.clock() + 60
+                    setStatus("Can't reach that block, another one")
+                end
+                return
+            end
+        end
+        local cb = mineCallback(b)
+        if not cb then
+            bad[b] = os.clock() + 3
+            return
+        end
+        setStatus("Mining (layer " .. layerOf(b) .. ")")
+        -- the MineBlock animation stops when the character moves (StopOnMove; seen live: mined while still sliding, the
+        -- animation stopped 0.4 s in and the block was never taken), so the mine starts once the character is at rest
+        stopWalk()
+        -- (the game stops it once the character is 1 stud from where it started, falling counted too: on the ground and
+        -- still first)
+        local ts = os.clock()
+        while alive() and os.clock() - ts < 1
+            and (root.AssemblyLinearVelocity.Magnitude > 0.5 or hum.FloorMaterial == Enum.Material.Air) do
+            RunService.Heartbeat:Wait()
+        end
+        if not use(cb) then
+            return
+        end
+        -- the MineBlock animation runs until the server removes the block (~5 s); the next block right after
+        local animator = hum:FindFirstChildOfClass("Animator")
+        local function mining()
+            for _, tr in ipairs(animator and animator:GetPlayingAnimationTracks() or {}) do
+                if tr.Animation and tostring(tr.Animation.AnimationId):find("14625391605", 1, true) then
+                    return true
+                end
+            end
+            return false
+        end
+        local t0, sawAnim = os.clock(), false
+        while alive() and b.Parent and os.clock() - t0 < 8 do
+            if mining() then
+                sawAnim = true
+            elseif sawAnim and os.clock() - t0 > 0.5 then
+                -- the animation was cut short (the block stays): mined again right away, not waited on
+                break
+            end
+            task.wait(0.05)
+        end
+        if b.Parent and alive() then
+            M.fails = (M.fails or 0) + 1
+            if M.fails >= 2 then
+                M.fails = 0
+                bad[b] = os.clock() + 10 -- the server did not take it
+            end
+            -- (the game's mine of it may still be waiting on the server: let that finish before trying again)
+            local tw = os.clock()
+            while alive() and b.Parent and not mineCallback(b) and os.clock() - tw < 6 do
+                task.wait(0.05)
+            end
+        else
+            M.fails = 0
+            -- a short look before the next block, at a person's pace (the user: not long, not instant)
+            local tp = os.clock() + 0.4 + math.random() * 0.4
+            while alive() and os.clock() < tp do
+                task.wait(0.05)
+            end
+        end
+    end
+
+    function M.stop()
+        table.clear(bad)
+        folderCache = nil
+    end
+
+    return M
+end)()
+
 local hookConns = {}
 local function hook(name, fn)
     local ok, handle = pcall(function()
@@ -19158,7 +20044,8 @@ local function farmLoop()
             or selectedJob == "Hairdresser - Stylez Hair Studio" and NC.hair.step
             or selectedJob == "Fisherman - Fishing Hut" and NC.fish.step
             or selectedJob == "Mechanic - Mike's Motors" and NC.mech.step
-            or selectedJob == "Stocker - BFF Supermarket" and NC.stock.step or farmStep)
+            or selectedJob == "Stocker - BFF Supermarket" and NC.stock.step
+            or selectedJob == "Miner - The Bloxburg Cave" and NC.miner.step or farmStep)
         if not ok then
             warn("[Legit Farm Job] " .. tostring(err))
             setStatus("Error, retrying")
@@ -19172,7 +20059,7 @@ end
 -- UI
 JobsTab:CreateDropdown({
     Name = "Select Job",
-    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio", "Fisherman - Fishing Hut", "Mechanic - Mike's Motors", "Stocker - BFF Supermarket" },
+    Options = { JOB_NAME, JANITOR_NAME, TAXI_NAME, ICE_NAME, CASH_NAME, "Fast Food Worker - Burger Cook", PIZZA_NAME, TEACHER_NAME, "BFF Supermarket", "Hairdresser - Stylez Hair Studio", "Fisherman - Fishing Hut", "Mechanic - Mike's Motors", "Stocker - BFF Supermarket", "Miner - The Bloxburg Cave" },
     CurrentOption = {},
     MultipleOptions = false,
     Flag = "LFJ_Job",
@@ -19250,6 +20137,7 @@ FarmToggle = JobsTab:CreateToggle({
             pcall(NC.fish.stop)
             pcall(NC.mech.stop)
             pcall(NC.stock.stop)
+            pcall(NC.miner.stop)
             if selectedJob ~= "Fast Food Worker - Burger Cook" then
                 stopWalking()
             end
@@ -19604,6 +20492,7 @@ getgenv().LegitFarmJob = function()
     pcall(NC.fish.stop)
     pcall(NC.mech.stop)
     pcall(NC.stock.stop)
+    pcall(NC.miner.stop)
     pcall(NC.ghost.stop)
     pcall(NC.seasonal.shutdown)
     pcall(NC.ghunt.shutdown)
