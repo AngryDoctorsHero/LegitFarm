@@ -9499,7 +9499,8 @@ NC.shared = (function()
                 if not deselectedKinds[p.Name] then
                     selected[p] = true
                 end
-            elseif streamedOut[p] then
+            elseif streamedOut[p] or (not selected[p] and not deselectedKinds[p.Name]) then
+                -- (also any food on the plot whose kind was never deselected: it is always selected, however it lost it)
                 -- the same food back after the game streamed it out of this client (StreamingEnabled) / it was moved:
                 -- selected again (it was dropped from the list when it left, and a food seen before was never selected
                 -- again: no ESP, never stored)
@@ -9509,6 +9510,11 @@ NC.shared = (function()
         end
         for p in pairs(selected) do
             if not (p.Parent and labelOf[p]) then
+                -- gone from the plot for now (streamed out / moved): selected again when it is back. Seen live after a
+                -- long run: a full refresh dropped foods here without this mark (the quick removal that sets it was
+                -- skipped in favour of the full refresh), so all 66 foods left on the plot were known but none selected:
+                -- no ESP, never stored, and "All selected food is stored"
+                streamedOut[p] = true
                 selected[p] = nil
             end
         end
@@ -11107,6 +11113,16 @@ NC.shared = (function()
                         end
                         storing = true
                         pcall(fridgeLog.start, target)
+                        -- the plot is scanned again every 5 s while it runs (not only when the game reports a change), so
+                        -- the food left on it is always what the script works from and what the status counts
+                        task.spawn(function()
+                            while storing and running do
+                                task.wait(5)
+                                if storing and running then
+                                    scheduleRefresh()
+                                end
+                            end
+                        end)
                         task.spawn(function()
                             -- an error never turns it off: the loop starts again until the toggle is turned off
                             while storing and running do
