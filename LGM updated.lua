@@ -11656,6 +11656,9 @@ NC.pizza = (function()
         { AgentRadius = 0.5, AgentHeight = 4, AgentCanJump = false },
     }
     local STAND_OFFSETS = {
+        -- first choice: closer to the counter (the user's pick; live the old first spot was 4.54 studs from the counter's
+        -- Base at all 4 stations, this one is 2.2), the others as before
+        Vector3.new(-4.85, 0, -3.65),
         Vector3.new(-6.5, 0, -5.3), Vector3.new(-5.5, 0, -4.3), Vector3.new(-7.5, 0, -6.3),
         Vector3.new(-6.5, 0, -3.3), Vector3.new(-4.5, 0, -6.3),
     }
@@ -11906,6 +11909,24 @@ NC.pizza = (function()
                 end
                 pcall(fn)
                 return true
+            end
+        end
+        -- mobile: found live (Delta), the game connects Done.Activated only for the "Default" (PC) input type; on touch it
+        -- adds Done as the "B_Done" interaction of the station's OrderDisplay instead (PizzaPlanetBaker module)
+        local reg = getInteractRegistry()
+        local entry = reg and reg[display]
+        local gens = entry and entry[1]
+        for _, gen in ipairs(type(gens) == "table" and gens or {}) do
+            if type(gen) == "function" then
+                local ok, text, _, cb = pcall(gen)
+                if ok and text == "B_Done" and type(cb) == "function" then
+                    if not cleanSafe(cb) then
+                        unsafe()
+                        return false
+                    end
+                    pcall(cb)
+                    return true
+                end
             end
         end
         return false
@@ -19582,6 +19603,8 @@ NC.store.buildUI()
 NC.autocook.buildUI(Window:CreateTab("Auto Cook", "chef-hat"))
 
 Window:CreateTab("Christmas Event", "gift"):CreateLabel("Coming soon...")
+
+Window:CreateTab("Student Farm", "graduation-cap"):CreateLabel("Coming soon...")
 
 NC.troll.buildUI(Window:CreateTab("Troll", "skull"))
 
